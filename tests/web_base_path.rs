@@ -107,9 +107,11 @@ async fn login_page_urls_carry_base() {
         body.contains(&format!("action=\"{BASE}/login\"")),
         "login form action missing base prefix:\n{body}"
     );
+    // The login page is the bare front-door shell (no nav pre-auth); the
+    // base-prefixed URL contract now rides on the stylesheet link.
     assert!(
-        body.contains(&format!("href=\"{BASE}/dashboard\"")),
-        "nav dashboard href missing base prefix:\n{body}"
+        body.contains(&format!("href=\"{BASE}/assets/app.css\"")),
+        "stylesheet link missing base prefix:\n{body}"
     );
 }
 

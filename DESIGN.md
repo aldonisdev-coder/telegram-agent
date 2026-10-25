@@ -115,3 +115,8 @@ xs 4, sm 8, md 16, lg 24, xl 32, xxl 48.
 ## 8. Do / Don't
 - Do: generous whitespace, one CTA per screen, clear empty states.
 - Don't: clutter, multiple competing colors, dense tables, jargon.
+## Materialization
+The tokens live in `assets/app.css` (served from the binary — no CDN). Light is
+the default; `[data-theme="dark"]` mirrors it. Change the tokens there, and the
+whole console follows. The operator console layout: left rail + ledger-style
+tables; setup and sign-in use the focused front-door shell.

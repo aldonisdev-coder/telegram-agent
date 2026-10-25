@@ -126,6 +126,10 @@ const SETUP_ENV_KEYS: [&str; 9] = [
 pub fn router(state: WebState) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/assets/app.css", get(app_css))
+        .route("/assets/fonts/IBMPlexSans-var.woff2", get(font_sans))
+        .route("/assets/fonts/IBMPlexMono-400.woff2", get(font_mono_400))
+        .route("/assets/fonts/IBMPlexMono-500.woff2", get(font_mono_500))
         .route("/setup", get(setup_page).post(setup_submit))
         .route("/login", get(login_page).post(login_submit))
         .route("/logout", get(logout))
@@ -191,128 +195,115 @@ pub(crate) async fn run_with_timeout(limit: Duration, req: Request, next: Next) 
     }
 }
 
+/// The design system, shipped from the binary (no CDN, no build step).
+const APP_CSS: &str = include_str!("../assets/app.css");
+const FONT_SANS: &[u8] = include_bytes!("../assets/fonts/IBMPlexSans-var.woff2");
+const FONT_MONO_400: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-400.woff2");
+const FONT_MONO_500: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-500.woff2");
+
+async fn app_css() -> Response {
+    asset_css()
+}
+async fn font_sans() -> Response {
+    asset_font(FONT_SANS)
+}
+async fn font_mono_400() -> Response {
+    asset_font(FONT_MONO_400)
+}
+async fn font_mono_500() -> Response {
+    asset_font(FONT_MONO_500)
+}
+
+fn asset_css() -> Response {
+    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], APP_CSS).into_response()
+}
+
+fn asset_font(body: &'static [u8]) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "font/woff2"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 fn html_page(base: &str, title: &str, body: &str) -> String {
     format!(
         r#"<!DOCTYPE html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{t} — Telegram Business</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@300;400;500;600&display=swap">
+<link rel="stylesheet" href="{base}/assets/app.css">
+<link rel="preload" href="{base}/assets/fonts/IBMPlexSans-var.woff2" as="font" type="font/woff2" crossorigin>
 <script>(function(){{var s=localStorage.getItem('theme');var d=window.matchMedia('(prefers-color-scheme: dark)').matches;document.documentElement.setAttribute('data-theme',s||(d?'dark':'light'));}})();</script>
-<style>
-:root {{
-  --color-primary:#0F172A; --color-on-primary:#FFFFFF;
-  --color-secondary:#1E293B; --color-on-secondary:#FFFFFF;
-  --color-accent:#16A34A; --color-on-accent:#0F172A;
-  --color-background:#F8FAFC; --color-foreground:#0F172A;
-  --color-card:#FFFFFF; --color-card-foreground:#0F172A;
-  --color-muted:#E2E8F0; --color-muted-foreground:#475569;
-  --color-border:#CBD5E1; --color-destructive:#DC2626; --color-on-destructive:#FFFFFF;
-  --color-ring:#16A34A;
-  --color-success:#16A34A; --color-warning:#D97706;
-  --font-heading:"Fira Code","SF Mono",ui-monospace,monospace;
-  --font-body:"Fira Sans",-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",sans-serif;
-  --space-xs:4px; --space-sm:8px; --space-md:16px; --space-lg:24px; --space-xl:32px; --space-2xl:48px; --space-3xl:64px;
-  --radius-sm:8px; --radius-md:12px; --radius-lg:16px;
-  --shadow-sm:0 1px 2px rgba(0,0,0,0.05);
-  --shadow-md:0 4px 6px rgba(0,0,0,0.1);
-  --shadow-lg:0 10px 15px rgba(0,0,0,0.1);
-  --shadow-xl:0 20px 25px rgba(0,0,0,0.15);
-  --transition:200ms ease;
-}}
-[data-theme="dark"] {{
-  --color-primary:#0F172A; --color-on-primary:#FFFFFF;
-  --color-secondary:#1E293B; --color-on-secondary:#FFFFFF;
-  --color-accent:#16A34A; --color-on-accent:#0F172A;
-  --color-background:#020617; --color-foreground:#F8FAFC;
-  --color-card:#0E1223; --color-card-foreground:#F8FAFC;
-  --color-muted:#1A1E2F; --color-muted-foreground:#94A3B8;
-  --color-border:#334155; --color-destructive:#DC2626; --color-on-destructive:#FFFFFF;
-  --color-ring:#FFFFFF;
-  --color-success:#16A34A; --color-warning:#F59E0B;
-  --shadow-sm:0 1px 2px rgba(0,0,0,0.4);
-  --shadow-md:0 4px 6px rgba(0,0,0,0.5);
-  --shadow-lg:0 10px 15px rgba(0,0,0,0.6);
-  --shadow-xl:0 20px 25px rgba(0,0,0,0.7);
-}}
-@media (prefers-color-scheme: dark) {{
-  :root:not([data-theme="light"]) {{
-    --color-primary:#0F172A; --color-on-primary:#FFFFFF;
-    --color-secondary:#1E293B; --color-on-secondary:#FFFFFF;
-    --color-accent:#16A34A; --color-on-accent:#0F172A;
-    --color-background:#020617; --color-foreground:#F8FAFC;
-    --color-card:#0E1223; --color-card-foreground:#F8FAFC;
-    --color-muted:#1A1E2F; --color-muted-foreground:#94A3B8;
-    --color-border:#334155; --color-destructive:#DC2626; --color-on-destructive:#FFFFFF;
-    --color-ring:#FFFFFF; --color-success:#16A34A; --color-warning:#F59E0B;
-  }}
-}}
-*{{box-sizing:border-box;margin:0}}
-html{{scroll-behavior:smooth}}
-body{{margin:0;font-family:var(--font-body);background:var(--color-background);color:var(--color-foreground);font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}}
-a{{color:var(--color-accent);text-decoration:none;transition:opacity var(--transition)}}
-a:hover{{opacity:0.8}}
-.container{{max-width:980px;margin:0 auto;padding:var(--space-xl) var(--space-md)}}
-.nav{{display:flex;flex-wrap:wrap;gap:var(--space-md);align-items:center;margin-bottom:var(--space-xl);font-size:14px;padding-bottom:var(--space-md);border-bottom:1px solid var(--color-border)}}
-.nav a{{color:var(--color-muted-foreground);font-weight:500;transition:color var(--transition)}}
-.nav a:hover{{color:var(--color-foreground)}}
-.nav .spacer{{flex:1}}
-.nav button.theme-toggle{{margin-left:auto}}
-h1{{font-family:var(--font-heading);font-size:28px;font-weight:600;letter-spacing:-0.02em;margin:0 0 var(--space-lg)}}
-h2{{font-family:var(--font-heading);font-size:22px;font-weight:600;letter-spacing:-0.01em;margin:0 0 var(--space-md)}}
-h3{{font-family:var(--font-heading);font-size:18px;font-weight:600;margin:0 0 var(--space-sm)}}
-p{{margin:0 0 var(--space-sm)}}
-.card{{background:var(--color-card);color:var(--color-card-foreground);border:1px solid var(--color-border);border-radius:var(--radius-md);box-shadow:var(--shadow-md);padding:var(--space-lg);margin-bottom:var(--space-md);transition:box-shadow var(--transition),transform var(--transition)}}
-.card:hover{{box-shadow:var(--shadow-lg);transform:translateY(-2px)}}
-.card p{{margin:8px 0;color:var(--color-muted-foreground)}}
-button{{display:inline-flex;align-items:center;justify-content:center;gap:var(--space-sm);background:var(--color-accent);color:var(--color-on-accent);padding:10px 20px;border-radius:var(--radius-sm);font-size:14px;font-weight:600;border:1px solid transparent;cursor:pointer;transition:all var(--transition);font-family:inherit}}
-button:hover{{opacity:0.9;transform:translateY(-1px)}}
-button:active{{transform:translateY(0)}}
-button:focus-visible{{outline:2px solid var(--color-ring);outline-offset:2px}}
-.btn{{display:inline-flex;align-items:center;justify-content:center;gap:var(--space-sm);background:var(--color-accent);color:var(--color-on-accent);padding:10px 20px;border-radius:var(--radius-sm);font-size:14px;font-weight:600;border:1px solid transparent;cursor:pointer;transition:all var(--transition);font-family:inherit}}
-.btn:hover{{opacity:0.9;transform:translateY(-1px)}}
-.btn:active{{transform:translateY(0)}}
-.btn:focus-visible{{outline:2px solid var(--color-ring);outline-offset:2px}}
-.btn-secondary{{background:transparent;color:var(--color-accent);border-color:var(--color-accent)}}
-.btn-secondary:hover{{background:var(--color-accent);color:var(--color-on-accent)}}
-.btn-danger{{background:var(--color-destructive);color:var(--color-on-destructive)}}
-.btn-ghost{{background:transparent;color:var(--color-muted-foreground);border-color:transparent;padding:8px 12px}}
-.btn-ghost:hover{{background:var(--color-muted);color:var(--color-foreground)}}
-.btn-sm{{padding:6px 12px;font-size:13px}}
-.input,textarea,select{{width:100%;padding:10px 12px;border:1px solid var(--color-border);border-radius:var(--radius-sm);font-size:15px;font-family:inherit;background:var(--color-card);color:var(--color-foreground);margin:6px 0 12px;transition:border-color var(--transition),box-shadow var(--transition)}}
-.input:focus,textarea:focus,select:focus{{outline:none;border-color:var(--color-accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--color-accent) 20%,transparent)}}
-textarea{{min-height:96px;resize:vertical}}
-label{{font-size:13px;color:var(--color-muted-foreground);display:block;margin-top:8px;font-weight:500}}
-.form-group{{margin-bottom:var(--space-md)}}
-.form-row{{display:grid;gap:var(--space-md)}}
-ul{{list-style:none;padding:0;margin:0}}
-li{{padding:10px 0;border-bottom:1px solid var(--color-border);font-size:14px}}
-li:last-child{{border-bottom:none}}
-form{{margin:0}}
-article{{background:var(--color-card);border:1px solid var(--color-border);border-radius:var(--radius-md);box-shadow:var(--shadow-md);padding:var(--space-lg)}}
-.empty{{text-align:center;color:var(--color-muted-foreground);padding:var(--space-2xl) 0}}
-.table-wrap{{overflow-x:auto;border:1px solid var(--color-border);border-radius:var(--radius-md)}}
-table{{width:100%;border-collapse:collapse;font-size:14px}}
-th,td{{padding:12px 16px;text-align:left;border-bottom:1px solid var(--color-border)}}
-th{{font-weight:600;color:var(--color-muted-foreground);background:var(--color-muted);font-size:12px;text-transform:uppercase;letter-spacing:0.05em}}
-tr:last-child td{{border-bottom:none}}
-tr:hover td{{background:var(--color-muted)}}
-.badge{{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:500;background:var(--color-muted);color:var(--color-muted-foreground)}}
-.badge-success{{background:color-mix(in srgb,var(--color-success) 15%,transparent);color:var(--color-success)}}
-.badge-danger{{background:color-mix(in srgb,var(--color-destructive) 15%,transparent);color:var(--color-destructive)}}
-.badge-warning{{background:color-mix(in srgb,var(--color-warning) 15%,transparent);color:var(--color-warning)}}
-.modal-overlay{{position:fixed;inset:0;background:rgba(0,0,0,0.5);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:50}}
-.modal{{background:var(--color-card);border-radius:var(--radius-lg);padding:var(--space-xl);box-shadow:var(--shadow-xl);max-width:500px;width:90%}}
-.sr-only{{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}}
-@media (max-width:768px){{.container{{padding:var(--space-lg) var(--space-sm)}}.nav{{gap:var(--space-sm)}}h1{{font-size:24px}}.card{{padding:var(--space-md)}}}}
-@media (max-width:480px){{.container{{padding:var(--space-md) var(--space-sm)}}h1{{font-size:22px}}}}
-@media (prefers-reduced-motion:reduce){{*{{transition:none!important;animation:none!important}}}}
-</style></head><body><main class="container">
-<nav class="nav"><a href="{base}/dashboard">Dashboard</a><a href="{base}/channels">Channels</a><a href="{base}/plans">Plans</a><a href="{base}/products">Products</a><a href="{base}/posts">Posts</a><a href="{base}/logout">Logout</a><button type="button" class="btn btn-ghost btn-sm theme-toggle" onclick="toggleTheme()">Theme</button></nav>
-{b}</main>
+</head><body>
+<div class="shell">
+<aside class="rail">
+  <div class="brand">{plane}<b>Telegram Business<small>operator console</small></b></div>
+  <div class="group">Operate</div>
+  <nav>{nav}</nav>
+  <div class="foot"><button type="button" class="btn btn-ghost btn-sm theme-toggle" onclick="toggleTheme()">Theme</button></div>
+</aside>
+<main class="main"><div class="measure">
+{b}
+</div></main>
+</div>
 <script>function toggleTheme(){{var c=document.documentElement.getAttribute('data-theme');var n=c==='dark'?'light':'dark';document.documentElement.setAttribute('data-theme',n);localStorage.setItem('theme',n);}}</script>
 </body></html>"#,
         base = base,
         t = title,
-        b = body
+        b = body,
+        plane = PLANE_SVG,
+        nav = rail_nav(base, title)
     )
+}
+
+/// Front-door shell for pre-auth pages (setup / login): no rail, a focused
+/// panel on a calm canvas, brand on top. The operator's first minute should
+/// be one action wide, not a dashboard pretending to be configured.
+fn html_page_bare(base: &str, title: &str, body: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{t} — Telegram Business</title>
+<link rel="stylesheet" href="{base}/assets/app.css">
+<script>(function(){{var s=localStorage.getItem('theme');var d=window.matchMedia('(prefers-color-scheme: dark)').matches;document.documentElement.setAttribute('data-theme',s||(d?'dark':'light'));}})();</script>
+</head><body>
+<div class="door">
+  <div class="brand">{plane}<b>Telegram Business</b></div>
+  <div class="panel">{b}</div>
+</div>
+</body></html>"#,
+        base = base,
+        t = title,
+        b = body,
+        plane = PLANE_SVG
+    )
+}
+
+/// Brand mark: a paper plane, drawn with three strokes — the same shape the
+/// product's world (Telegram) speaks in, reduced to the console's own line weight.
+const PLANE_SVG: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 3.5 3.8 10.2c-.8.3-.8 1.4 0 1.7l4.9 1.8 1.8 4.9c.3.8 1.4.8 1.7 0L19 5.5"/><path d="M10.5 13.7 21 3.5"/></svg>"#;
+
+/// Rail nav with the current page marked. The active entry is derived from
+/// the page title (they are the same vocabulary on purpose — one name per
+/// place, per DESIGN.md's voice rules).
+fn rail_nav(base: &str, title: &str) -> String {
+    let items = [
+        ("dashboard", "Dashboard"),
+        ("channels", "Channels"),
+        ("plans", "Plans"),
+        ("products", "Products"),
+        ("posts", "Posts"),
+    ];
+    let mut out = String::new();
+    for (path, label) in items {
+        let active = if title.eq_ignore_ascii_case(label) {
+            " class=\"active\""
+        } else {
+            ""
+        };
+        out.push_str(&format!("<a href=\"{base}/{path}\"{active}>{label}</a>"));
+    }
+    out.push_str(&format!("<a href=\"{base}/logout\">Log out</a>"));
+    out
 }
 
 #[derive(Clone)]
@@ -377,11 +368,17 @@ async fn login_page(State(state): State<WebState>) -> impl IntoResponse {
     if !setup_done(&state) {
         return Redirect::to(&state.url("/setup")).into_response();
     }
-    Html(html_page(
+    Html(html_page_bare(
         &state.base_path,
         "Login",
         &format!(
-            r#"<article><h2>Login</h2><form method="post" action="{}"><label>Username<input type="text" name="username" required></label><label>Password<input type="password" name="password" required></label><button type="submit">Sign in</button></form></article>"#,
+            r#"<h2>Sign in</h2>
+<p class="help">The operator console for your Telegram shop.</p>
+<form method="post" action="{}">
+<label>Username<input type="text" name="username" required autocomplete="username"></label>
+<label>Password<input type="password" name="password" required autocomplete="current-password"></label>
+<button type="submit">Sign in</button>
+</form>"#,
             state.url("/login")
         ),
     ))
@@ -403,10 +400,11 @@ async fn login_submit(
     if login_throttle(&state.login_attempts, &f.username, 5, 900) {
         return (
             axum::http::StatusCode::TOO_MANY_REQUESTS,
-            Html(html_page(
+            Html(html_page_bare(
                 &state.base_path,
                 "Login",
-                "<h2>Login</h2><p style=\"color:red\">Too many attempts. Try again later.</p>",
+                r##"<div class="alert alert-error">Too many attempts. Try again in a few minutes.</div>
+<p><a href="#">Back to sign in</a></p>"##,
             )),
         )
             .into_response();
@@ -436,11 +434,16 @@ async fn login_submit(
             .into_response()
     } else {
         // The failure was already recorded by `login_throttle` above.
-        Html(html_page(
+        Html(html_page_bare(
             &state.base_path,
             "Login",
             &format!(
-                r#"<article><h2>Login</h2><p style="color:red">Invalid credentials.</p><form method="post" action="{}"><label>Username<input type="text" name="username" required></label><label>Password<input type="password" name="password" required></label><button type="submit">Sign in</button></form></article>"#,
+                r#"<div class="alert alert-error">Invalid credentials. Check the username and password, then try again.</div>
+<form method="post" action="{}">
+<label>Username<input type="text" name="username" required autocomplete="username"></label>
+<label>Password<input type="password" name="password" required autocomplete="current-password"></label>
+<button type="submit">Sign in</button>
+</form>"#,
                 state.url("/login")
             ),
         ))
@@ -492,30 +495,15 @@ async fn dashboard(
         .unwrap_or_else(|| "(none)".into());
     let plans = state.db.list_plans(seller_scope);
     let subs = state.db.list_subscriptions(seller_scope, 10);
-    let body = format!(
-        r#"<h1>Dashboard ({})</h1>
-<article class="card"><h3>Default channel</h3><p>{}</p></article>
-<article class="card"><h3>Plans ({})</h3><ul>{}</ul></article>
-<article class="card"><h3>Create plan</h3><form method="post" action="{}">
-<label>Name<input name="name" required></label>
-<label>Price<input name="price" required></label>
-<label>Asset<input name="asset" required></label>
-<label>Duration days<input name="duration_days" type="number" required></label>
-<label>Channel<input name="channel" placeholder="@channel (optional)"></label>
-<button type="submit">Create plan</button></form></article>
-<article class="card"><h3>Recent subscriptions ({})</h3><ul>{}</ul></article>
-<article class="card"><h3>Post</h3><form method="post" action="{}">
-<label>Channel<input name="channel" placeholder="@channel (optional)"></label>
-<label>Text<textarea name="text" required></textarea></label>
-<button type="submit">Post</button></form></article>"#,
-        esc(&session.role),
-        esc(&ch),
-        plans.len(),
+    let plans_list = if plans.is_empty() {
+        "<li class=\"empty\"><b>No plans yet.</b>Create your first plan below — buyers see it in the shop.</li>"
+            .to_string()
+    } else {
         plans
             .iter()
             .map(|p| {
                 format!(
-                    "<li>{} — {} {} / {} days</li>",
+                    "<li><b>{}</b><span class=\"mono\">{} {}</span><span class=\"help\">/ {} days</span></li>",
                     esc(&p.0),
                     esc(&p.1),
                     esc(&p.2),
@@ -523,9 +511,12 @@ async fn dashboard(
                 )
             })
             .collect::<Vec<_>>()
-            .join(""),
-        state.url("/plan"),
-        subs.len(),
+            .join("")
+    };
+    let subs_list = if subs.is_empty() {
+        "<li class=\"empty\"><b>No subscriptions yet.</b>They appear here the moment a buyer activates.</li>"
+            .to_string()
+    } else {
         subs.iter()
             .map(|s| {
                 format!(
@@ -537,7 +528,35 @@ async fn dashboard(
                 )
             })
             .collect::<Vec<_>>()
-            .join(""),
+            .join("")
+    };
+    let body = format!(
+        r#"<h1>Dashboard <span class="sub">({})</span></h1>
+<article class="panel"><h3>Default channel</h3><p class="mono">{}</p></article>
+<div class="grid-2">
+<article class="panel"><h3>Plans ({})</h3><ul>{}</ul></article>
+<article class="panel"><h3>Recent subscriptions ({})</h3><ul>{}</ul></article>
+</div>
+<div class="grid-2">
+<article class="panel"><h3>Create plan</h3><form method="post" action="{}">
+<label>Name<input name="name" required></label>
+<label>Price<input name="price" required></label>
+<label>Asset<input name="asset" required></label>
+<label>Duration days<input name="duration_days" type="number" required></label>
+<label>Channel<input name="channel" placeholder="@channel (optional)"></label>
+<button type="submit">Create plan</button></form></article>
+<article class="panel"><h3>Post</h3><form method="post" action="{}">
+<label>Channel<input name="channel" placeholder="@channel (optional)"></label>
+<label>Text<textarea name="text" required></textarea></label>
+<button type="submit">Post</button></form></article>
+</div>"#,
+        esc(&session.role),
+        esc(&ch),
+        plans.len(),
+        plans_list,
+        subs.len(),
+        subs_list,
+        state.url("/plan"),
         state.url("/post"),
     );
     Html(html_page(&state.base_path, "Dashboard", &body)).into_response()
@@ -568,12 +587,18 @@ async fn channels_page(
             set.insert(c);
         }
     }
-    let body = format!(
-        "<h1>Channels</h1><ul>{}</ul>",
+    let list = if set.is_empty() {
+        "<li class=\"empty\"><b>No channels yet.</b>Channels appear here as you add plans and set a default channel.</li>"
+            .to_string()
+    } else {
         set.iter()
-            .map(|c| format!("<li>{}</li>", esc(c)))
+            .map(|c| format!("<li><span class=\"mono\">{}</span></li>", esc(c)))
             .collect::<Vec<_>>()
             .join("")
+    };
+    let body = format!(
+        "<h1>Channels <span class=\"sub\">known to this console</span></h1><article class=\"panel\"><ul>{}</ul></article>",
+        list
     );
     Html(html_page(&state.base_path, "Channels", &body)).into_response()
 }
@@ -592,25 +617,30 @@ async fn plans_page(
         None
     };
     let plans = state.db.list_plans(seller_scope);
-    let list_items = plans
-        .iter()
-        .map(|p| {
-            format!(
-                "<li>{} — {} {} / {} days <form method=\"post\" action=\"{}\" style=\"display:inline\"><input type=\"hidden\" name=\"name\" value=\"{}\"><button type=\"submit\">Delete</button></form></li>",
-                esc(&p.0),
-                esc(&p.1),
-                esc(&p.2),
-                p.3,
-                state.url("/plandel"),
-                esc(&p.0)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
+    let list_items = if plans.is_empty() {
+        "<li class=\"empty\"><b>No plans yet.</b>Create one below — it appears in the shop immediately.</li>"
+            .to_string()
+    } else {
+        plans
+            .iter()
+            .map(|p| {
+                format!(
+                    "<li><b>{}</b><span class=\"mono\">{} {}</span><span class=\"help\">/ {} days</span><span class=\"row-action\"><form method=\"post\" action=\"{}\" class=\"inline-form\"><input type=\"hidden\" name=\"name\" value=\"{}\"><button type=\"submit\" class=\"btn btn-danger btn-sm\">Delete</button></form></span></li>",
+                    esc(&p.0),
+                    esc(&p.1),
+                    esc(&p.2),
+                    p.3,
+                    state.url("/plandel"),
+                    esc(&p.0)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
     let body = format!(
-        r#"<h1>Plans</h1>
-<ul>{}</ul>
-<article class="card"><h3>Create plan</h3><form method="post" action="{}">
+        r#"<h1>Plans <span class="sub">what buyers can purchase</span></h1>
+<article class="panel"><ul>{}</ul></article>
+<article class="panel"><h3>Create plan</h3><form method="post" action="{}">
 <label>Name<input name="name" required></label>
 <label>Price<input name="price" required></label>
 <label>Asset<input name="asset" required></label>
@@ -798,7 +828,7 @@ async fn products_page(
                     "<span class=\"badge badge-danger\">inactive</span>"
                 };
                 format!(
-                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><form method=\"post\" action=\"{}\" style=\"display:inline\"><input type=\"hidden\" name=\"name\" value=\"{}\"><button type=\"submit\" class=\"btn btn-danger btn-sm\">Deactivate</button></form></td></tr>",
+                    "<tr><td><b>{}</b></td><td class=\"num\">{}</td><td class=\"mono\">{}</td><td>{}</td><td class=\"num\">{}</td><td>{}</td><td class=\"actions\"><form method=\"post\" action=\"{}\" class=\"inline-form\"><input type=\"hidden\" name=\"name\" value=\"{}\"><button type=\"submit\" class=\"btn btn-danger btn-sm\">Deactivate</button></form></td></tr>",
                     esc(&p.2),
                     esc(&p.3),
                     esc(&p.4),
@@ -812,7 +842,7 @@ async fn products_page(
             .collect::<Vec<_>>()
             .join("");
         format!(
-            "<div class=\"table-wrap\"><table><thead><tr><th>Name</th><th>Price</th><th>Asset</th><th>Kind</th><th>Stock</th><th>Active</th><th></th></tr></thead><tbody>{}</tbody></table></div>",
+            "<div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num\">Price</th><th>Asset</th><th>Kind</th><th class=\"num\">Stock</th><th>Active</th><th></th></tr></thead><tbody>{}</tbody></table></div>",
             rows
         )
     };
@@ -887,7 +917,7 @@ async fn create_product(
             &state.base_path,
             "Products",
             &format!(
-                r#"<h1>Products</h1><p style="color:red">{}</p><p><a href="{}">Back to products</a></p>"#,
+                r#"<div class="alert alert-error">{}</div><p><a href="{}">Back to products</a></p>"#,
                 esc(&e.to_string()),
                 state.url("/products")
             ),
@@ -934,8 +964,8 @@ async fn setup_page(State(state): State<WebState>) -> impl IntoResponse {
         return Redirect::to(&state.url("/login")).into_response();
     }
     let body = format!(
-        r#"<article><h2>Welcome — first-run setup</h2>
-<p>Configure your bot. You can also edit <code>.env</code> later.</p>
+        r#"<h2>Welcome — first-run setup</h2>
+<p class="help">Connect your bot and claim the console. Takes about two minutes; every field has a hint below.</p>
 <details open><summary>How to get a bot token (2 minutes, no skills needed)</summary>
 <ol><li>Open Telegram and message <a href="https://t.me/BotFather" rel="noopener">@BotFather</a>.</li>
 <li>Send <code>/newbot</code>, choose a display name, then a username ending in <code>bot</code>.</li>
@@ -943,17 +973,19 @@ async fn setup_page(State(state): State<WebState>) -> impl IntoResponse {
 <li>For your owner ID, message <a href="https://t.me/userinfobot" rel="noopener">@userinfobot</a> — it replies with your numeric ID.</li>
 <li>Keep the bot's privacy mode ON; add it as <b>admin</b> to your channel when you sell access.</li></ol></details>
 <form method="post" action="{}">
-<label>Bot token (from @BotFather)<input type="text" name="bot_token" required></label>
-<label>Owner Telegram user ID<input type="text" name="owner_id" required></label>
-<label>Default channel (optional, e.g. @yourchannel)<input type="text" name="default_channel"></label>
-<label>Crypto Pay token (optional)<input type="text" name="crypto_token"></label>
-<label>Dashboard username<input type="text" name="web_username" value="owner"></label>
-<label>Dashboard password (min 6 chars)<input type="password" name="web_password" required></label>
+<label>Bot token<input type="text" name="bot_token" required autocomplete="off" placeholder="123456:ABC-DEF…"><span class="help">From @BotFather. Stored in .env with 0600 permissions, never logged.</span></label>
+<label>Owner Telegram user ID<input type="text" name="owner_id" required inputmode="numeric" placeholder="123456789"><span class="help">Your numeric ID from @userinfobot — this account owns the console.</span></label>
+<label>Default channel<input type="text" name="default_channel" placeholder="@yourchannel"><span class="help">Optional — where posts and grants go when nothing else is set.</span></label>
+<label>Crypto Pay token<input type="text" name="crypto_token" autocomplete="off" placeholder="from @CryptoBot → Crypto Pay → Create App"><span class="help">Optional — enables automated payment verification.</span></label>
+<div class="form-row">
+<div><label>Dashboard username<input type="text" name="web_username" value="owner" autocomplete="username"></label></div>
+<div><label>Dashboard password<input type="password" name="web_password" required minlength="6" autocomplete="new-password"><span class="help">At least 6 characters — this unlocks the console.</span></label></div>
+</div>
 <button type="submit">Save and continue</button>
-</form></article>"#,
+</form>"#,
         state.url("/setup")
     );
-    Html(html_page(&state.base_path, "Setup", &body)).into_response()
+    Html(html_page_bare(&state.base_path, "Setup", &body)).into_response()
 }
 
 async fn setup_submit(
@@ -966,31 +998,16 @@ async fn setup_submit(
     // Validate bot token.
     let token = f.bot_token.trim().to_string();
     if token.is_empty() {
-        return Html(html_page(
-            &state.base_path,
-            "Setup",
-            "<p style=\"color:red\">Bot token is required.</p>",
-        ))
-        .into_response();
+        return setup_error(&state, "Bot token is required.");
     }
     let ok = validate_bot_token(&token).await;
     if !ok {
-        return Html(html_page(
-            &state.base_path,
-            "Setup",
-            "<p style=\"color:red\">Invalid bot token (Telegram rejected it).</p>",
-        ))
-        .into_response();
+        return setup_error(&state, "Invalid bot token (Telegram rejected it).");
     }
     let owner_id: i64 = match f.owner_id.trim().parse() {
         Ok(v) if v > 0 => v,
         _ => {
-            return Html(html_page(
-                &state.base_path,
-                "Setup",
-                "<p style=\"color:red\">Owner ID must be a positive number.</p>",
-            ))
-            .into_response();
+            return setup_error(&state, "Owner ID must be a positive number.");
         }
     };
     let uname = f
@@ -1000,12 +1017,7 @@ async fn setup_submit(
         .unwrap_or_else(|| "owner".to_string());
     let pw = f.web_password.clone().unwrap_or_default();
     if pw.len() < 6 {
-        return Html(html_page(
-            &state.base_path,
-            "Setup",
-            "<p style=\"color:red\">Password must be at least 6 characters.</p>",
-        ))
-        .into_response();
+        return setup_error(&state, "Password must be at least 6 characters.");
     }
     let channel = f.default_channel.clone().filter(|s| !s.trim().is_empty());
     let crypto = f.crypto_token.clone().filter(|s| !s.trim().is_empty());
@@ -1031,15 +1043,10 @@ async fn setup_submit(
         let existing = match std::fs::read_to_string(&env_path) {
             Ok(s) => s,
             Err(e) => {
-                return Html(html_page(
-                    &state.base_path,
-                    "Setup",
-                    &format!(
-                        "<p style=\"color:red\">Failed to read .env: {}</p>",
-                        esc(&e.to_string())
-                    ),
-                ))
-                .into_response();
+                return setup_error(
+                    &state,
+                    &format!("Failed to read .env: {}", esc(&e.to_string())),
+                );
             }
         };
         for line in existing.lines() {
@@ -1077,15 +1084,10 @@ async fn setup_submit(
         content.push('\n');
     }
     if let Err(e) = std::fs::write(&env_path, &content) {
-        return Html(html_page(
-            &state.base_path,
-            "Setup",
-            &format!(
-                "<p style=\"color:red\">Failed to write .env: {}</p>",
-                esc(&e.to_string())
-            ),
-        ))
-        .into_response();
+        return setup_error(
+            &state,
+            &format!("Failed to write .env: {}", esc(&e.to_string())),
+        );
     }
     // best-effort permissions 0600
     #[cfg(unix)]
@@ -1110,13 +1112,27 @@ async fn setup_submit(
     state.db.set_config("setup_done", "1");
 
     let body = format!(
-        r#"<article><h2>Setup complete</h2>
-<p>Configuration saved to <code>.env</code>. Restart the application to start the bot with the new settings.</p>
-<p>If running under Docker/systemd, the service will restart automatically; otherwise restart manually.</p>
-<a href="{}">Go to login</a></article>"#,
+        r#"<div class="alert alert-success">Setup complete. Configuration saved to <code>.env</code>.</div>
+<p>Restart the application to start the bot with the new settings. If it runs under Docker or systemd the service restart handles it; otherwise start it again manually.</p>
+<p><a class="btn" href="{}">Go to sign in</a></p>"#,
         state.url("/login")
     );
-    Html(html_page(&state.base_path, "Setup", &body)).into_response()
+    Html(html_page_bare(&state.base_path, "Setup", &body)).into_response()
+}
+
+/// Pre-setup error surface: the front-door shell with an honest alert and a
+/// way back. Every setup failure says what happened and what to do next.
+fn setup_error(state: &WebState, msg: &str) -> Response {
+    Html(html_page_bare(
+        &state.base_path,
+        "Setup",
+        &format!(
+            r#"<div class="alert alert-error">{}</div><p><a href="{}">Back to setup</a></p>"#,
+            msg,
+            state.url("/setup")
+        ),
+    ))
+    .into_response()
 }
 
 async fn validate_bot_token(token: &str) -> bool {
