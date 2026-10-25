@@ -23,6 +23,16 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 proptest = "1.11"
 
+# The vendored teloxide is IDENTICAL to crates.io 0.17.0 except for one
+# removed docs-only dependency: aquamarine (a mermaid-diagram doc macro)
+# pulls in proc-macro-error2, which is unmaintained (RUSTSEC-2026-0173) and
+# denied by `cargo deny check` in the gate. Stripping it here keeps the
+# whole unmaintained subtree out of the lock instead of ignoring the
+# advisory. Rebase this fork on the next teloxide bump; the diff is one
+# attribute in src/update_listeners/polling.rs plus this dependency.
+[patch.crates-io]
+teloxide = { path = "vendor/teloxide" }
+
 [dependencies]
 teloxide = { version = "0.17", features = ["macros", "ctrlc_handler", "sqlite-storage-rustls"] }
 tokio = { version = "1", features = ["full"] }

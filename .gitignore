@@ -18,9 +18,14 @@
 /.commandcode
 /.mimosa
 
-# Vendored dependency sources — public builds resolve from crates.io;
-# the local copy stays on disk for offline builds only
-/vendor
+# Vendored dependency sources — only the PATCHED crates are tracked (see
+# [patch.crates-io] in Cargo.toml: the teloxide fork strips aquamarine and
+# with it the unmaintained proc-macro-error2 from the dependency graph).
+# Everything else a future `cargo vendor` run drops here stays untracked.
+/vendor/*
+!/vendor/teloxide/
+/vendor/teloxide/target/
+/vendor/teloxide/Cargo.lock
 
 # Release bundles — binaries ship as GitHub Releases, not in the tree
 /telegram-agent-*/
