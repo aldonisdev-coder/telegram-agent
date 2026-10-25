@@ -23,9 +23,6 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 proptest = "1.11"
 
-[patch.crates-io]
-teloxide = { path = "vendor/teloxide" }
-
 [dependencies]
 teloxide = { version = "0.17", features = ["macros", "ctrlc_handler", "sqlite-storage-rustls"] }
 tokio = { version = "1", features = ["full"] }
