@@ -15,6 +15,9 @@ pub struct Config {
     pub ai_api_key: Option<String>,
     pub ai_model: String,
     pub ai_daily_token_budget: Option<i64>,
+    /// Static bearer token for the MCP endpoint. None/empty = endpoint fully
+    /// disabled (secure default OFF) — see `mcp_enabled`.
+    pub mcp_owner_token: Option<String>,
 }
 
 pub const APP_DIR_NAME: &str = "telegram-agent";
@@ -123,6 +126,15 @@ impl Config {
         !self.bot_token.trim().is_empty() && self.owner_id != 0
     }
 
+    /// Whether the MCP endpoint accepts requests at all. Unset/empty token =
+    /// OFF regardless of what a caller presents, so the endpoint can never be
+    /// reached by accident on a default install.
+    pub fn mcp_enabled(&self) -> bool {
+        self.mcp_owner_token
+            .as_deref()
+            .is_some_and(|t| !t.is_empty())
+    }
+
     pub fn web_port(&self) -> u16 {
         env::var("WEB_PORT")
             .ok()
@@ -200,6 +212,7 @@ impl Config {
         let ai_daily_token_budget = env::var("AI_DAILY_TOKEN_BUDGET")
             .ok()
             .and_then(|s| s.parse().ok());
+        let mcp_owner_token = env::var("MCP_OWNER_TOKEN").ok().filter(|s| !s.is_empty());
         Self {
             bot_token,
             owner_id,
@@ -212,6 +225,7 @@ impl Config {
             ai_api_key,
             ai_model,
             ai_daily_token_budget,
+            mcp_owner_token,
         }
     }
 }

@@ -14,7 +14,7 @@ use telegram_agent::{
     dialogue::State,
     expire_subscriptions, handlers,
     handlers::registry::{CommandContext, CommandRegistry},
-    roles, services, util, web,
+    mcp, roles, services, util, web,
 };
 
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -390,8 +390,23 @@ async fn main() {
     let cfg_crypto = cfg.clone();
 
     // Plugin commands registered at startup (see handlers::registry). The
-    // binary itself registers none; embedded hosts and forks can add theirs.
-    let registry = Arc::new(CommandRegistry::new());
+    // binary registers only the MCP approval commands (/approvals, /approve,
+    // /deny); embedded hosts and forks can add theirs. Registration must
+    // happen before the registry is frozen into an Arc, so the web state the
+    // approval executors share with the MCP endpoint is built first.
+    let base = cfg.web_base_path();
+    let web_state = web::WebState {
+        db: db.clone(),
+        cfg: cfg.clone(),
+        bot: bot.clone(),
+        login_attempts: std::sync::Arc::new(
+            std::sync::Mutex::new(std::collections::HashMap::new()),
+        ),
+        base_path: base.clone(),
+    };
+    let mut registry = CommandRegistry::new();
+    mcp::register_commands(&mut registry, web_state.clone());
+    let registry = Arc::new(registry);
     let registry_for_commands = registry.clone();
 
     let handler = dptree::entry()
@@ -475,19 +490,12 @@ async fn main() {
         .build();
 
     // Web UI state.
-    let base = cfg.web_base_path();
-    let web_state = web::WebState {
-        db: db.clone(),
-        cfg: cfg.clone(),
-        bot: bot.clone(),
-        login_attempts: std::sync::Arc::new(
-            std::sync::Mutex::new(std::collections::HashMap::new()),
-        ),
-        base_path: base.clone(),
-    };
     let web_router = web::router(web_state.clone());
-    let api_router = api::router(web_state);
-    let web_router = web::mount(&base, web_router.merge(api_router));
+    let api_router = api::router(web_state.clone());
+    let web_router = web::mount(
+        &base,
+        web_router.merge(api_router).merge(mcp::router(web_state)),
+    );
     let web_port: u16 = cfg.web_port();
     let web_bind = cfg.web_bind();
     let listener = match tokio::net::TcpListener::bind(format!("{web_bind}:{web_port}")).await {

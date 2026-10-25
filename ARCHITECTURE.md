@@ -1,7 +1,7 @@
 # Architecture — Telegram Business Platform
 
 Multi-tenant platform for sellers to run subscription businesses on Telegram:
-one Rust binary, two interfaces (bot + web), one SQLite database.
+one Rust binary, three interfaces (bot + web + MCP), one SQLite database.
 
 **New here?** Read this page top-to-bottom (~5 min), then `docs/EASY_SETUP.md`
 to run your own instance. **Working on the code?** Read `AGENT.md` (standards)
@@ -10,26 +10,30 @@ and `AUTO_ROUTE.md` (who does what) before your first change.
 ## Quick picture
 
 ```
-┌─────────────────┐     ┌─────────────────┐
-│  Telegram Bot   │     │  Web Dashboard  │
-│  (teloxide)     │     │  (axum)         │
-│  handlers/      │     │  web.rs         │
-└────────┬────────┘     └────────┬────────┘
-         │                       │
-         └──────────┬────────────┘
-                    │  role check: roles::role_of()
-            ┌───────▼───────┐
-            │ Domain Core   │  db.rs · crypto.rs · ai/ · dialogue.rs
-            └───────┬───────┘
-                    │  parameterized SQL, seller_id scoping
-            ┌───────▼───────┐
-            │  SQLite (WAL) │  data/agent.db
-            └───────────────┘
+┌───────────────┐  ┌─────────────────┐  ┌────────────────────┐
+│  Telegram Bot │  │  Web Dashboard  │  │  MCP (AI agents)   │
+│  (teloxide)   │  │  (axum)         │  │  mcp/ (JSON-RPC)   │
+│  handlers/    │  │  web.rs + api.rs│  │  /api/v1/mcp       │
+└───────┬───────┘  └────────┬────────┘  └─────────┬──────────┘
+        │                   │                     │
+        └───────────────────┴──────────┬──────────┘
+                              │  role check: roles::role_of()
+                              │  + tiered tool permissions (mcp/)
+                     ┌────────▼────────┐
+                     │  Domain Core    │  db.rs · crypto.rs · ai/ · dialogue.rs
+                     └────────┬────────┘
+                              │  parameterized SQL, seller_id scoping
+                     ┌────────▼────────┐
+                     │  SQLite (WAL)   │  data/agent.db
+                     └─────────────────┘
 ```
 
-Two thin interfaces, one core. Interfaces parse input and render output; every
+Three thin interfaces, one core. Interfaces parse input and render output; every
 business rule and every write lives in the core, behind `Db` methods. That is
-the rule that keeps the bot and the dashboard from drifting apart.
+the rule that keeps the bot, the dashboard and the MCP endpoint from drifting
+apart. The MCP interface is AI-facing: its tools are tiered (Read / Write /
+Sensitive — see PLAN.md) and Sensitive tools never execute without an owner's
+`/approve` in the bot.
 
 ## Modules
 
@@ -43,6 +47,7 @@ the rule that keeps the bot and the dashboard from drifting apart.
 | `src/roles.rs` | role resolution (Owner > Admin > Seller > User) | L8 |
 | `src/dialogue.rs` | conversation state | L8 |
 | `src/api.rs` | API surface | L8 |
+| `src/mcp/` | MCP surface for AI agents — JSON-RPC, tool tiers, approval gate | L8 |
 | `src/ai/` | AI providers (OpenAI/Anthropic), cost, rate limits | L8 |
 | `src/handlers/` | bot commands, messages, callbacks | L8 (callbacks: L7) |
 | `src/web.rs` | axum routes, auth, HTML | L7 |

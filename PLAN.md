@@ -49,6 +49,35 @@ gap designs, scale seam contracts), `docs/DEPLOY_PROFILES.md`, `docs/DESKTOP.md`
 - Remove legacy `/process` refund endpoints (S). Changelog automation (S).
 - First real-world pilot: one bot, one channel, one digital + one physical
   product, one refund, backup-restore drill.
+- **MCP server (v1.3.x, in progress).** The fourth thin interface over the
+  domain core: a hand-rolled MCP (JSON-RPC) endpoint at `POST /api/v1/mcp`
+  inside the existing axum router — zero new dependencies, same `WebState`
+  (db + cfg + bot). Designed AI-first, because the primary caller is an
+  AI agent, not a human:
+  - **Auth:** `MCP_OWNER_TOKEN` env (static bearer → Owner principal).
+    Empty/unset = endpoint disabled entirely (secure default OFF).
+    Constant-time comparison. v2: a `mcp_tokens` table with per-seller
+    tokens issued via bot command; `Principal { role, seller_id }` is
+    threaded through every tool now so that is additive, not a redesign.
+  - **Tool tiers — the permission model:**
+    - *Read* (`readOnlyHint`, direct): list_channels, list_plans,
+      list_posts, subs_report (user ids masked by default), list_codes
+      (codes masked by default).
+    - *Write* (direct, audited): publish_post, edit_post.
+    - *Sensitive* (`destructiveHint`, **server-side approval gate**):
+      gen_codes (returns secrets), delete_post (destructive), broadcast
+      (high blast radius). Calling one creates a pending row and returns
+      `requires_approval` — nothing executes. The OWNER approves via the
+      bot (`/approvals`, `/approve <id>`, `/deny <id>`, owner-only,
+      15-minute expiry); execution happens on approval, and secrets
+      (generated codes) are delivered to the owner's Telegram chat, never
+      back into the AI's transcript.
+  - **Audit:** every tool call and every approve/deny lands in
+    `mcp_audit` (tool, role, ok, truncated detail).
+  - **Rate limit:** reuse the AI rate-limiter pattern on the endpoint.
+  - Verification: in-process axum oneshot tests (no network, no real bot) —
+    auth, protocol methods, tier annotations, masking, the full
+    approval lifecycle, audit rows.
 
 ### v2 (trigger-driven)
 - Bookings: services/slots/bookings reusing the invoice pipeline.

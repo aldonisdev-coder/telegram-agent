@@ -1155,6 +1155,7 @@ mod tests {
             ai_api_key: None,
             ai_model: "gpt-4o-mini".to_string(),
             ai_daily_token_budget: None,
+            mcp_owner_token: None,
         };
         let bot = teloxide::Bot::new(cfg.bot_token.clone());
         let state = WebState {

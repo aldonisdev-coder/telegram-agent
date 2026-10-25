@@ -35,6 +35,7 @@ fn make_state(base: &str) -> (WebState, tempfile::TempDir) {
         ai_api_key: None,
         ai_model: "gpt-4o-mini".to_string(),
         ai_daily_token_budget: None,
+        mcp_owner_token: None,
     };
     let state = WebState {
         db: Arc::new(db),

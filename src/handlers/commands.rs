@@ -1306,16 +1306,8 @@ pub async fn cmd_handler(
                 } else {
                     db.list_users()
                 };
-                let mut sent = 0;
-                for uid in users {
-                    if bot
-                        .send_message(teloxide::types::ChatId(uid), text.clone())
-                        .await
-                        .is_ok()
-                    {
-                        sent += 1;
-                    }
-                }
+                // Send loop shared with the MCP broadcast tool (crate::broadcast_to_users).
+                let sent = crate::broadcast_to_users(&bot, &users, &text).await;
                 bot.send_message(chat_id, format!("Broadcast sent to {} users.", sent))
                     .await?;
             }

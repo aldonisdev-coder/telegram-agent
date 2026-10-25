@@ -261,6 +261,33 @@ CREATE TABLE IF NOT EXISTS scheduled_posts (
     posted_message_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_scheduled_posts_status_time ON scheduled_posts(status, scheduled_at);
+
+-- MCP approvals: sensitive tool calls park here until the owner decides via
+-- the bot; args_json is replayed verbatim on approval.
+CREATE TABLE IF NOT EXISTS mcp_approvals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    tool        TEXT NOT NULL,
+    args_json   TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    decided_at  TEXT,
+    executed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_approvals_status ON mcp_approvals(status);
+
+-- MCP audit: one row per tool-call outcome (ok or err), detail truncated by
+-- the insert helper so secrets never land here.
+CREATE TABLE IF NOT EXISTS mcp_audit (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    tool       TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    ok         INTEGER NOT NULL,
+    detail     TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_audit_created ON mcp_audit(created_at);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_status_expires ON subscriptions(status, expires_at);

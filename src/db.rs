@@ -92,6 +92,17 @@ type ApiKeyRow = (
     Option<String>,
 );
 type ApiKeyListRow = (i64, i64, Option<String>, String, i64, Option<String>);
+type McpApprovalRow = (
+    i64,            // id
+    String,         // tool
+    String,         // args_json
+    String,         // status
+    String,         // created_at
+    String,         // expires_at
+    Option<String>, // decided_at
+    Option<String>, // executed_at
+);
+type McpAuditRow = (i64, String, String, bool, Option<String>, String);
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -247,6 +258,18 @@ impl Db {
         let _ = conn.execute("CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT NOT NULL UNIQUE, seller_id INTEGER NOT NULL, product_id INTEGER NOT NULL, buyer_user_id INTEGER NOT NULL, invoice_id TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending', tracking TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)", []);
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_orders_seller_status ON orders(seller_id, status)",
+            [],
+        );
+        // v1.3 MCP: server-side approval gate for sensitive tools, plus a
+        // dedicated audit trail for every tool call outcome.
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS mcp_approvals (id INTEGER PRIMARY KEY AUTOINCREMENT, tool TEXT NOT NULL, args_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, expires_at TEXT NOT NULL, decided_at TEXT, executed_at TEXT)", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mcp_approvals_status ON mcp_approvals(status)",
+            [],
+        );
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS mcp_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, tool TEXT NOT NULL, role TEXT NOT NULL, ok INTEGER NOT NULL, detail TEXT, created_at TEXT NOT NULL)", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mcp_audit_created ON mcp_audit(created_at)",
             [],
         );
         // invoices.product_id: nullable item reference selecting the grant
@@ -2288,6 +2311,38 @@ impl Db {
         };
         res.unwrap_or(0)
     }
+
+    /// (status, count) for every status present, server-side GROUP BY so the
+    /// MCP subs_report aggregates without pulling user rows.
+    pub fn subscription_status_counts(&self, seller_scope: Option<i64>) -> Vec<(String, i64)> {
+        let conn = self.conn.lock().unwrap();
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) =
+            if let Some(sid) = seller_scope {
+                (
+                    "SELECT status, COUNT(*) FROM subscriptions WHERE seller_id=?1 GROUP BY status"
+                        .to_string(),
+                    vec![Box::new(sid)],
+                )
+            } else {
+                (
+                    "SELECT status, COUNT(*) FROM subscriptions GROUP BY status".to_string(),
+                    vec![],
+                )
+            };
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        );
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
     pub fn count_invoices(&self, seller_scope: Option<i64>, status_opt: Option<&str>) -> i64 {
         let conn = self.conn.lock().unwrap();
         let mut sql = "SELECT COUNT(*) FROM invoices".to_string();
@@ -2371,6 +2426,158 @@ impl Db {
             out.push((sid, self.revenue_total(Some(sid))));
         }
         out
+    }
+
+    // ---- MCP approvals & audit ----
+    /// Park a sensitive tool call: row starts 'pending' and is executed only
+    /// after the owner approves it in the bot. Returns the approval id.
+    pub fn mcp_create_approval(&self, tool: &str, args_json: &str, expires_at: &str) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "INSERT INTO mcp_approvals(tool,args_json,status,created_at,expires_at) VALUES(?1,?2,'pending',?3,?4)",
+            params![tool, args_json, now, expires_at],
+        );
+        conn.last_insert_rowid()
+    }
+
+    pub fn mcp_get_approval(&self, id: i64) -> Option<McpApprovalRow> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id,tool,args_json,status,created_at,expires_at,decided_at,executed_at FROM mcp_approvals WHERE id=?1",
+            params![id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// Transition a pending approval to `status` ('approved'/'denied'/'expired').
+    /// The `status='pending'` guard makes the decide atomic: concurrent or
+    /// repeated decides lose the rowcount race and return false, so a
+    /// double-approve can never execute twice.
+    pub fn mcp_decide_approval(&self, id: i64, status: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let n = conn
+            .execute(
+                "UPDATE mcp_approvals SET status=?1, decided_at=?2 WHERE id=?3 AND status='pending'",
+                params![status, now, id],
+            )
+            .unwrap_or(0);
+        n > 0
+    }
+
+    pub fn mcp_mark_executed(&self, id: i64) {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "UPDATE mcp_approvals SET executed_at=?1 WHERE id=?2",
+            params![now, id],
+        );
+    }
+
+    pub fn mcp_list_approvals(&self, status: Option<&str>, limit: i64) -> Vec<McpApprovalRow> {
+        let conn = self.conn.lock().unwrap();
+        // Lazy purge: pendings past their expiry flip to 'expired' on every
+        // list, so /approvals never offers a stale row for approval.
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "UPDATE mcp_approvals SET status='expired', decided_at=?1 WHERE status='pending' AND expires_at < ?1",
+            params![now],
+        );
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(st) = status {
+            // Pending list reads oldest-first so the owner sees the longest
+            // waiting request at the top; terminal lists read newest-first.
+            let order = if st == "pending" { "ASC" } else { "DESC" };
+            (
+                format!(
+                    "SELECT id,tool,args_json,status,created_at,expires_at,decided_at,executed_at FROM mcp_approvals WHERE status=?1 ORDER BY id {order} LIMIT ?2"
+                ),
+                vec![Box::new(st.to_string()), Box::new(limit)],
+            )
+        } else {
+            (
+                "SELECT id,tool,args_json,status,created_at,expires_at,decided_at,executed_at FROM mcp_approvals ORDER BY id DESC LIMIT ?1".to_string(),
+                vec![Box::new(limit)],
+            )
+        };
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    /// One row per MCP tool-call outcome. `detail` is truncated to 200 chars
+    /// here (the single choke point) so an over-verbose caller can never leak
+    /// a large payload — and generated codes must never be passed as detail.
+    pub fn mcp_audit(&self, tool: &str, role: &str, ok: bool, detail: Option<&str>) {
+        let detail = detail.map(|d| d.chars().take(200).collect::<String>());
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "INSERT INTO mcp_audit(tool,role,ok,detail,created_at) VALUES(?1,?2,?3,?4,?5)",
+            params![tool, role, ok, detail, now],
+        );
+    }
+
+    pub fn mcp_list_audit(&self, limit: i64) -> Vec<McpAuditRow> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id,tool,role,ok,detail,created_at FROM mcp_audit ORDER BY id DESC LIMIT ?1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(params![limit], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
     }
 }
 

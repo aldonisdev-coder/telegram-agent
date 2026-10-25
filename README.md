@@ -79,6 +79,28 @@ cargo build --release
 ```
 Web dashboard: http://localhost:8080 (set `WEB_PORT`, `WEB_USERNAME`, `WEB_PASSWORD` in `.env`). Login with owner credentials; sellers get accounts via `/becomeseller` or `/dashboard`.
 
+## MCP server (AI agents)
+
+Expose the operator as tools to AI agents (ZCode, Claude, Cursor, …) via the
+[Model Context Protocol](https://modelcontextprotocol.io): `POST /api/v1/mcp`.
+Set `MCP_OWNER_TOKEN` in `.env` (empty = endpoint disabled, secure default OFF),
+then register the server in your agent's MCP settings:
+
+```json
+{ "telegram-agent": { "url": "http://127.0.0.1:8080/api/v1/mcp",
+                      "headers": { "Authorization": "Bearer <MCP_OWNER_TOKEN>" } } }
+```
+
+The token maps to the **Owner** principal. Tools are tiered so AI use stays safe:
+
+| Tier | Tools | Behavior |
+|------|-------|----------|
+| Read | `list_channels`, `list_plans`, `list_posts`, `subs_report`, `list_codes` | Direct; PII and activation codes **masked by default** |
+| Write | `publish_post`, `edit_post` | Direct; every call audited |
+| Sensitive | `gen_codes`, `delete_post`, `broadcast` | **Never execute on the AI's say-so**: the call parks a pending approval and the AI is told to wait; **you** approve via `/approve <id>` in the bot (owner-only, 15-minute expiry). Generated codes are delivered to your Telegram chat — never into the AI's transcript |
+
+Every tool call and every approve/deny is written to the `mcp_audit` table.
+
 ## How selling works
 1. Create a plan: `/planadd Premium | 10 | USDT | 30`.
 2. User buys: `/buy Premium` → bot returns pay link + invoice id.

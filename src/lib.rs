@@ -12,6 +12,7 @@ pub mod db;
 pub mod dialogue;
 pub mod embed;
 pub mod handlers;
+pub mod mcp;
 pub mod roles;
 pub mod services;
 pub mod util;
@@ -37,4 +38,22 @@ pub async fn expire_subscriptions(bot: &Bot, db: &db::Db) -> usize {
         n += 1;
     }
     n
+}
+
+/// Send `text` to every user id in `users`, counting deliveries. Shared by
+/// the `/broadcast` command and the MCP `broadcast` tool so the send loop and
+/// its failure-tolerance (skip undeliverable, keep going) stay single-sourced.
+/// Returns the number of users the message was delivered to.
+pub async fn broadcast_to_users(bot: &Bot, users: &[i64], text: &str) -> usize {
+    let mut sent = 0;
+    for uid in users {
+        if bot
+            .send_message(teloxide::types::ChatId(*uid), text.to_string())
+            .await
+            .is_ok()
+        {
+            sent += 1;
+        }
+    }
+    sent
 }
