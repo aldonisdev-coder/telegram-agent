@@ -82,8 +82,39 @@ pub fn extract_invoice_items(v: &serde_json::Value) -> Vec<serde_json::Value> {
 // interfaces (see `web::login_throttle` / `web::login_ok`).
 
 // ---------- Health ----------
-async fn health() -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!({"status":"ok"})))
+/// Enriched liveness probe. Backward compatible: still a 200 with the
+/// original `status` field; adds `db` (SELECT 1 probe), `bot`
+/// (`configured` | `setup`), `mcp` (`enabled` | `disabled`) and
+/// `uptime_seconds`. No secrets or identifiers in the response.
+async fn health(State(state): State<WebState>) -> impl IntoResponse {
+    let db_ok = state.db.ping();
+    let status = if db_ok { "ok" } else { "error" };
+    let bot = if state.cfg.is_configured() {
+        "configured"
+    } else {
+        "setup"
+    };
+    let mcp = if state
+        .cfg
+        .mcp_owner_token
+        .as_deref()
+        .map(|t| !t.trim().is_empty())
+        .unwrap_or(false)
+    {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": status,
+            "db": if db_ok { "ok" } else { "error" },
+            "bot": bot,
+            "mcp": mcp,
+            "uptime_seconds": crate::metrics::uptime_secs(),
+        })),
+    )
 }
 
 // ---------- Auth ----------
@@ -111,7 +142,7 @@ async fn auth_login(State(state): State<WebState>, Json(f): Json<LoginReq>) -> i
         )
         .into_response();
     }
-    match state.db.verify_web_password(&f.username, &f.password) {
+    match state.db.verify_web_password(&f.username, &f.password).await {
         Some((account_id, role, seller_id)) => {
             crate::web::login_ok(&state.login_attempts, &f.username);
             let token = state.db.create_web_session(account_id, &role, seller_id, 7);
@@ -173,7 +204,26 @@ async fn auth_me(State(state): State<WebState>, headers: HeaderMap) -> impl Into
 
 #[derive(Deserialize)]
 struct PasswordReq {
+    /// Required for non-owner accounts: the current password, verified via
+    /// the same bcrypt path login uses (`verify_web_password`). The owner's
+    /// web session is the strongest identity a deployment has and may omit
+    /// it (there is no other owner-password surface — see setup/main.rs).
+    current_password: Option<String>,
     new_password: String,
+}
+
+/// Extract the session token the way `session_from_headers` resolves it
+/// (cookie first, then Bearer) so the password change can keep the caller's
+/// session while evicting every other session of the account.
+fn caller_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(t) = crate::web::get_cookie(headers) {
+        return Some(t);
+    }
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t.to_string())
 }
 
 async fn auth_password(
@@ -185,15 +235,58 @@ async fn auth_password(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    // Sessions do not carry the account username and Db has no
-    // get_web_account_by_id -> update path, so this historically returned
-    // success without doing anything. Be honest about it instead of lying.
-    let _ = (session, f.new_password);
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({"error":"not implemented"})),
-    )
-        .into_response()
+    let Some((_id, username, _hash, role, _seller)) =
+        state.db.get_web_account_by_id(session.account_id)
+    else {
+        // A session whose account row vanished (deleted account): be honest
+        // instead of silently succeeding.
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "account_not_found",
+            "session account no longer exists",
+        )
+        .into_response();
+    };
+    // Mirror the setup form's "min 6 chars" rule (web.rs setup_submit).
+    if f.new_password.chars().count() < 6 {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "weak_password",
+            "password must be at least 6 characters",
+        )
+        .into_response();
+    }
+    // Non-owner accounts must prove knowledge of the current password via
+    // the same bcrypt verification the login uses.
+    if role != "owner" {
+        // spawn_blocking hasher is async: awaiting happens here, not in a
+        // sync closure (mechanical restructure of the former Option::map).
+        let verified = match f.current_password.as_deref() {
+            Some(cur) => state.db.verify_web_password(&username, cur).await.is_some(),
+            None => false,
+        };
+        if !verified {
+            return err(
+                StatusCode::UNAUTHORIZED,
+                "invalid_credentials",
+                "current password missing or incorrect",
+            )
+            .into_response();
+        }
+    }
+    if let Err(e) = state
+        .db
+        .update_web_password_by_id(session.account_id, &f.new_password)
+        .await
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "update_failed", &e).into_response();
+    }
+    // Password rotation invalidates every OTHER session of this account (a
+    // stolen session must not survive it); the caller stays logged in.
+    if let Some(tok) = caller_token(&headers) {
+        state.db.delete_other_web_sessions(session.account_id, &tok);
+    }
+    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
 
 // ---------- Sellers ----------
@@ -917,11 +1010,31 @@ async fn codes_delete(
     if session.role == "seller" && session.seller_id != Some(seller_id) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your code").into_response();
     }
-    // Db has no delete_code (verified) — previously this pretended success
-    // without deleting anything. Report honestly until a real delete exists.
+    // Real delete via the scoped helper (L8 db.rs addition): sellers delete
+    // only their own codes, admin/owner any. `seller_scope` yields None for
+    // admin/owner and Some(id) for sellers.
+    if !state
+        .db
+        .delete_code_seller_scoped(&code, seller_scope(&session))
+    {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "delete_failed",
+            "code delete failed",
+        )
+        .into_response();
+    }
+    state.db.log_action(
+        session.account_id,
+        &session.role,
+        "code_delete",
+        "code",
+        &code,
+        None,
+    );
     (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({"error":"not implemented"})),
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "deleted": code})),
     )
         .into_response()
 }
@@ -2996,6 +3109,7 @@ async fn admin_web_accounts_create(
     match state
         .db
         .create_web_account(&f.username, &f.password, &f.role, f.seller_id)
+        .await
     {
         Ok(()) => {
             state.db.log_action(
@@ -3057,7 +3171,7 @@ async fn admin_web_accounts_password(
         )
         .into_response();
     }
-    match state.db.update_web_password_by_id(id, &f.password) {
+    match state.db.update_web_password_by_id(id, &f.password).await {
         Ok(()) => {
             state.db.log_action(
                 session.account_id,
@@ -3284,12 +3398,13 @@ mod tests {
         }
     }
 
-    fn make_state() -> (WebState, tempfile::TempDir) {
+    async fn make_state() -> (WebState, tempfile::TempDir) {
         // reuse web test helper pattern
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db").to_str().unwrap().to_string();
         let db = Db::new(&db_path).unwrap();
         db.create_web_account("owner", "secret", "owner", None)
+            .await
             .unwrap();
         let cfg = Config {
             bot_token: "123:abc".to_string(),
@@ -3318,7 +3433,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_ok() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let app = router(state);
         let resp = app
             .oneshot(
@@ -3334,7 +3449,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_login_and_me() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let app = router(state);
         let resp = app
             .clone()
@@ -3369,7 +3484,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_unauth_returns_401() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let app = router(state);
         let resp = app
             .oneshot(
@@ -3384,11 +3499,12 @@ mod tests {
     }
 
     // ---- helpers ----
-    fn make_seller_state() -> (WebState, tempfile::TempDir) {
-        let (state, dir) = make_state();
+    async fn make_seller_state() -> (WebState, tempfile::TempDir) {
+        let (state, dir) = make_state().await;
         state
             .db
             .create_web_account("seller", "secret", "seller", Some(42))
+            .await
             .unwrap();
         state
             .db
@@ -3407,7 +3523,7 @@ mod tests {
     // ---- Auth ----
     #[tokio::test]
     async fn api_me_returns_role() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let token = owner_token(&state);
         let app = router(state);
         let resp = app
@@ -3430,7 +3546,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_logout_revokes() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let token = owner_token(&state);
         let app = router(state);
         let resp = app
@@ -3462,7 +3578,7 @@ mod tests {
     // ---- Plans ----
     #[tokio::test]
     async fn api_plans_create_list_get() {
-        let (state, _dir) = make_seller_state();
+        let (state, _dir) = make_seller_state().await;
         let token = seller_token(&state);
         let db = state.db.clone();
         let app = router(state);
@@ -3509,7 +3625,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_plans_update_delete() {
-        let (state, _dir) = make_seller_state();
+        let (state, _dir) = make_seller_state().await;
         let token = seller_token(&state);
         let db = state.db.clone();
         let app = router(state);
@@ -3578,7 +3694,7 @@ mod tests {
     // ---- Subscriptions ----
     #[tokio::test]
     async fn api_subs_create_list_get_patch() {
-        let (state, _dir) = make_seller_state();
+        let (state, _dir) = make_seller_state().await;
         let token = seller_token(&state);
         let app = router(state);
         let resp = app
@@ -3644,7 +3760,7 @@ mod tests {
     // ---- Invoices ----
     #[tokio::test]
     async fn api_invoices_create_list_get_status() {
-        let (state, _dir) = make_seller_state();
+        let (state, _dir) = make_seller_state().await;
         let token = seller_token(&state);
         let app = router(state);
         let resp = app
@@ -3742,7 +3858,7 @@ mod tests {
     // ---- Codes ----
     #[tokio::test]
     async fn api_codes_create_list_get_redeem() {
-        let (state, _dir) = make_seller_state();
+        let (state, _dir) = make_seller_state().await;
         let token = seller_token(&state);
         let app = router(state);
         let resp = app
@@ -3806,7 +3922,7 @@ mod tests {
     // ---- Posts ----
     #[tokio::test]
     async fn api_posts_create_list() {
-        let (state, _dir) = make_seller_state();
+        let (state, _dir) = make_seller_state().await;
         let token = seller_token(&state);
         let app = router(state);
         let resp = app
@@ -3844,7 +3960,7 @@ mod tests {
     // ---- Users ----
     #[tokio::test]
     async fn api_users_list_upsert() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let token = owner_token(&state);
         let app = router(state);
         let resp = app
@@ -3883,7 +3999,7 @@ mod tests {
     // ---- Stats ----
     #[tokio::test]
     async fn api_dashboard_summary() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let token = owner_token(&state);
         let app = router(state);
         let resp = app
@@ -3901,7 +4017,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_revenue() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let token = owner_token(&state);
         let app = router(state);
         let resp = app
@@ -3920,7 +4036,7 @@ mod tests {
     // ---- Channels ----
     #[tokio::test]
     async fn api_channels_list() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let token = owner_token(&state);
         let app = router(state);
         let resp = app
@@ -3939,7 +4055,7 @@ mod tests {
     // ---- Config ----
     #[tokio::test]
     async fn api_config_get_set() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let token = owner_token(&state);
         let app = router(state);
         let resp = app
@@ -3988,7 +4104,7 @@ mod tests {
     // ---- AI ----
     #[tokio::test]
     async fn api_ai_templates_crud() {
-        let (state, _dir) = make_seller_state();
+        let (state, _dir) = make_seller_state().await;
         let token = seller_token(&state);
         let app = router(state);
         let resp = app
@@ -4066,7 +4182,7 @@ mod tests {
     // ---- Finance ----
     #[tokio::test]
     async fn api_finance_summary() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let token = owner_token(&state);
         let app = router(state);
         let resp = app
@@ -4085,7 +4201,7 @@ mod tests {
     // ---- Admin (owner) ----
     #[tokio::test]
     async fn api_admin_stats() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let token = owner_token(&state);
         let app = router(state);
         let resp = app
@@ -4103,7 +4219,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_admin_sellers() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let token = owner_token(&state);
         let app = router(state);
         let resp = app
@@ -4121,7 +4237,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_admin_web_accounts_crud() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let token = owner_token(&state);
         let db = state.db.clone();
         let app = router(state);
@@ -4170,7 +4286,7 @@ mod tests {
     // ---- Role gating ----
     #[tokio::test]
     async fn api_seller_cannot_access_admin() {
-        let (state, _dir) = make_seller_state();
+        let (state, _dir) = make_seller_state().await;
         let token = seller_token(&state);
         let app = router(state);
         let resp = app
@@ -4188,7 +4304,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_unauth_all_protected() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let app = router(state);
         for uri in [
             "/api/v1/plans",
@@ -4202,6 +4318,273 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "uri {}", uri);
         }
+    }
+
+    // ---- L8 additions (2026-10-25): auth_password, codes_delete, /health,
+    // /metrics. Reuse the module's state helpers above.
+
+    async fn change_password(app: &Router, token: &str, body: &str) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/password")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {}", token))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn delete_code(app: &Router, token: &str, code: &str) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/codes/{}", code).as_str())
+                    .header("authorization", format!("Bearer {}", token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn auth_password_non_owner_requires_current() {
+        let (state, _dir) = make_seller_state().await;
+        let app = router(state.clone());
+        let token = seller_token(&state);
+        // Missing current password -> rejected, nothing changes.
+        let resp = change_password(&app, &token, r#"{"new_password":"brandnewpw"}"#).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Wrong current password -> rejected.
+        let resp = change_password(
+            &app,
+            &token,
+            r#"{"new_password":"brandnewpw","current_password":"wrong"}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            state
+                .db
+                .verify_web_password("seller", "secret")
+                .await
+                .is_some()
+        );
+        // Correct current password -> the hash rotates (same bcrypt path the
+        // login uses) and the old password stops verifying.
+        let resp = change_password(
+            &app,
+            &token,
+            r#"{"new_password":"brandnewpw","current_password":"secret"}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            state
+                .db
+                .verify_web_password("seller", "brandnewpw")
+                .await
+                .is_some()
+        );
+        assert!(
+            state
+                .db
+                .verify_web_password("seller", "secret")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_password_invalidates_other_sessions() {
+        let (state, _dir) = make_seller_state().await;
+        let app = router(state.clone());
+        let token_a = seller_token(&state);
+        let token_b = seller_token(&state);
+        let resp = change_password(
+            &app,
+            &token_a,
+            r#"{"new_password":"brandnewpw","current_password":"secret"}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The caller's session survives the rotation...
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/me")
+                    .header("authorization", format!("Bearer {}", token_a))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // ...every OTHER session of the account is gone.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/me")
+                    .header("authorization", format!("Bearer {}", token_b))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_password_owner_changes_without_current() {
+        let (state, _dir) = make_state().await;
+        let app = router(state.clone());
+        let token = owner_token(&state);
+        let resp = change_password(&app, &token, r#"{"new_password":"newownerpw"}"#).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            state
+                .db
+                .verify_web_password("owner", "newownerpw")
+                .await
+                .is_some()
+        );
+        assert!(
+            state
+                .db
+                .verify_web_password("owner", "secret")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn codes_delete_is_seller_scoped_and_real() {
+        let (state, _dir) = make_seller_state().await;
+        let own = state.db.create_code(42, None, Some(30), 1, None);
+        let other = state.db.create_code(43, None, Some(30), 1, None);
+        let app = router(state.clone());
+        let seller = seller_token(&state);
+
+        // Own code: the row is actually gone.
+        let resp = delete_code(&app, &seller, &own).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            state.db.get_code(&own).is_none(),
+            "code row must be deleted"
+        );
+
+        // Cross-seller: rejected, the row survives untouched.
+        let resp = delete_code(&app, &seller, &other).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            state.db.get_code(&other).is_some(),
+            "cross-seller delete must not touch the code"
+        );
+
+        // Admin/owner may delete any seller's code.
+        let owner = owner_token(&state);
+        let resp = delete_code(&app, &owner, &other).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(state.db.get_code(&other).is_none());
+    }
+
+    #[tokio::test]
+    async fn codes_delete_unknown_returns_404() {
+        let (state, _dir) = make_seller_state().await;
+        let app = router(state.clone());
+        let token = owner_token(&state);
+        let resp = delete_code(&app, &token, "NOPE_NOPE_NOPE").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn health_reports_components() {
+        let (state, _dir) = make_state().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["db"], "ok");
+        assert_eq!(v["bot"], "configured");
+        assert_eq!(v["mcp"], "disabled"); // make_state: mcp_owner_token = None
+        assert!(v["uptime_seconds"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn metrics_scrape_ok_and_no_raw_path_labels() {
+        let (state, _dir) = make_seller_state().await;
+        // Mirror main.rs: metrics middleware over the API router.
+        let app = router(state).layer(axum::middleware::from_fn(crate::metrics::track_http));
+        let secret = "sub_tok_9f8e7d6c5b4a";
+        // Hit a real route, then an UNMATCHED route whose path AND query
+        // string carry a token-like secret — the house-lesson attack shape:
+        // a metrics endpoint that labels by raw path leaks it verbatim.
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/codes/{}/nope?token={}", secret, secret).as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(ct.starts_with("text/plain"), "content-type {ct}");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body).to_string();
+        assert!(!text.contains(secret), "metrics leaked raw path: {text}");
+        assert!(text.contains("http_requests_total{route=\"health\",status_class=\"2xx\"}"));
+        // The unmatched token-bearing route lands in the fixed catch-all
+        // category, never the raw path.
+        assert!(text.contains("http_requests_total{route=\"other\",status_class=\"4xx\"}"));
+        assert!(text.contains("# TYPE uptime_seconds gauge"));
+        assert!(text.contains("bot_messages_sent_total "));
     }
 }
 // ---------- Invoices (claim) ----------
@@ -4518,6 +4901,10 @@ async fn webhook_cryptopay(
 pub fn router(state: WebState) -> Router {
     Router::new()
         .route("/health", get(health))
+        // Prometheus scrape endpoint. No auth by design: the default bind is
+        // 127.0.0.1 and this MUST NOT be exposed publicly. Labels are fixed
+        // route categories only — see src/metrics.rs for the invariant.
+        .route("/metrics", get(crate::metrics::render_metrics))
         // auth
         .route("/api/v1/auth/login", post(auth_login))
         .route("/api/v1/auth/logout", post(auth_logout))

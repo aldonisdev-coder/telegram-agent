@@ -99,7 +99,7 @@ impl AgentAppBuilder {
                     pw
                 });
             if db.get_web_account_by_username(&uname).is_none()
-                && let Err(e) = db.create_web_account(&uname, &pw, "owner", None)
+                && let Err(e) = db.create_web_account(&uname, &pw, "owner", None).await
             {
                 tracing::warn!("failed to seed owner web account: {}", e);
             }

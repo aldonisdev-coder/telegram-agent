@@ -768,16 +768,10 @@ pub async fn cmd_handler(
                     .await?;
                 return Ok(());
             }
-            // Product tuple: (id, seller_id, name, price, asset, kind,
-            // delivery, stock, active). Only active products are purchasable.
-            let products: Vec<_> = db
-                .find_products_by_name(name)
-                .into_iter()
-                .filter(|p| p.8 != 0)
-                .collect();
-            // Plan tuple: (seller_id, id, price, asset, name, days, channel).
-            let plans = db.find_plans_by_name(name);
-            let mut products = products;
+            // Seller-scoped /buy resolution over the (seller_id, name) plan
+            // namespace (2026-10-25 review HIGH). See resolve_buy_candidates
+            // for the B5 fallback order.
+            let (plans, mut products) = resolve_buy_candidates(&db, role, user_id, name);
             match (
                 products.len() + plans.len(),
                 products.pop(),
@@ -1379,7 +1373,9 @@ pub async fn cmd_handler(
                 .unwrap_or_else(|| format!("seller_{}", user_id));
             if db.get_web_account_by_username(&username).is_none() {
                 let password = util::gen_token(12);
-                if let Err(e) = db.create_web_account(&username, &password, "seller", Some(user_id))
+                if let Err(e) = db
+                    .create_web_account(&username, &password, "seller", Some(user_id))
+                    .await
                 {
                     bot.send_message(
                         chat_id,
@@ -1407,7 +1403,7 @@ pub async fn cmd_handler(
             if newpw.len() < 6 {
                 bot.send_message(chat_id, "Password must be at least 6 characters.")
                     .await?;
-            } else if db.update_web_password(&uname, &newpw).is_ok() {
+            } else if db.update_web_password(&uname, &newpw).await.is_ok() {
                 bot.send_message(chat_id, "Web dashboard password updated.")
                     .await?;
             } else {
@@ -1426,7 +1422,10 @@ pub async fn cmd_handler(
                 bot.send_message(chat_id, format!("Web dashboard: {}\nUsername: {}\n(Use /setwebpassword to change password.)", url, uname)).await?;
             } else {
                 let password = util::gen_token(12);
-                match db.create_web_account(&uname, &password, "seller", Some(user_id)) {
+                match db
+                    .create_web_account(&uname, &password, "seller", Some(user_id))
+                    .await
+                {
                     Ok(_) => {
                         bot.send_message(
                             chat_id,
@@ -1513,6 +1512,74 @@ pub async fn cmd_handler(
         }
     }
     Ok(())
+}
+
+/// Resolve `/buy <name>` candidates under the (seller_id, name) plan
+/// namespace (2026-10-25 review HIGH: the old lookup was global by bare name,
+/// leaking pricing across sellers and mis-resolving `/buy`). B5 fallback
+/// semantics, mirroring `channel_of`:
+///
+/// 1. The caller's OWN namespace (seller_id = user_id) always wins — a seller
+///    is never shadowed by, and can never resolve into, another seller's
+///    same-name plan.
+/// 2. The global namespace (seller_id = 0: legacy pre-multi-tenant rows and
+///    admin-created catalogue entries) is resolvable only by Admin/Owner.
+/// 3. Plain buyers (Role::User) fall back to the cross-seller active shop
+///    view MINUS the global namespace — public-mode /buy keeps working
+///    (README "Two modes"); ambiguous names still error exactly as the v1.2
+///    record's deferred seller-disambiguation syntax intends.
+/// 4. The Owner may additionally resolve any seller's entry by name
+///    (superuser; the review's "owner can").
+///
+/// Returns (plans, products) in `list_plans`/`list_products` row shapes,
+/// active rows only.
+fn resolve_buy_candidates(
+    db: &Db,
+    role: roles::Role,
+    user_id: i64,
+    name: &str,
+) -> (Vec<crate::db::PlanRow>, Vec<crate::db::ProductRow>) {
+    let mut plans = db.find_plans_by_name(Some(user_id), name);
+    let mut products: Vec<crate::db::ProductRow> = db
+        .find_products_by_name(Some(user_id), name)
+        .into_iter()
+        .filter(|p| p.8 != 0)
+        .collect();
+    if plans.is_empty() && products.is_empty() {
+        if role >= roles::Role::Admin {
+            // Global (seller_id = 0) namespace: admin/owner-only.
+            plans = db.find_plans_by_name(Some(0), name);
+            products = db
+                .find_products_by_name(Some(0), name)
+                .into_iter()
+                .filter(|p| p.8 != 0)
+                .collect();
+        }
+        if role == roles::Role::User {
+            // Public-mode shop view: any seller's active entry except the
+            // global namespace, which stays admin/owner-only.
+            plans = db
+                .find_plans_by_name(None, name)
+                .into_iter()
+                .filter(|p| p.6 != 0)
+                .collect();
+            products = db
+                .find_products_by_name(None, name)
+                .into_iter()
+                .filter(|p| p.8 != 0 && p.1 != 0)
+                .collect();
+        }
+        if role == roles::Role::Owner && plans.is_empty() && products.is_empty() {
+            // Owner superuser: may resolve any seller's entry by name.
+            plans = db.find_plans_by_name(None, name);
+            products = db
+                .find_products_by_name(None, name)
+                .into_iter()
+                .filter(|p| p.8 != 0)
+                .collect();
+        }
+    }
+    (plans, products)
 }
 
 /// Resolve the target channel for a caller. Sellers may only operate on their
@@ -2045,5 +2112,102 @@ mod tests {
             Some("2026-01-02T00:00:00+00:00".into())
         );
         assert_eq!(parse_schedule_datetime("tomorrow"), None);
+    }
+
+    // ---- /buy resolution over the (seller_id, name) plan namespace ----
+
+    fn buy_db() -> (tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::new(dir.path().join("buy.db").to_str().unwrap()).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn buy_resolution_is_seller_scoped() {
+        // Cross-seller plan isolation (2026-10-25 review HIGH): two sellers
+        // may both define "pro" and each resolves only their own; a name
+        // unique to another seller is invisible from the wrong namespace.
+        let (_d, db) = buy_db();
+        db.add_plan(1, "pro", "10", "USDT", 30, None);
+        db.add_plan(2, "pro", "20", "USDT", 30, None);
+        let (plans, products) = resolve_buy_candidates(&db, roles::Role::Seller, 1, "pro");
+        assert!(products.is_empty());
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].1, "10");
+        assert_eq!(plans[0].6, 1);
+        let (plans2, _) = resolve_buy_candidates(&db, roles::Role::Seller, 2, "pro");
+        assert_eq!(plans2[0].1, "20");
+        db.add_plan(2, "solo", "5", "TON", 7, None);
+        let (solo, _) = resolve_buy_candidates(&db, roles::Role::Seller, 1, "solo");
+        assert!(solo.is_empty(), "seller 1 must not resolve seller 2's plan");
+        // Same isolation for products (the /buy multiplex resolves both).
+        db.add_product(2, "widget", "3", "TON", "digital_link", Some("l"), None)
+            .unwrap();
+        let (p, w) = resolve_buy_candidates(&db, roles::Role::Seller, 1, "widget");
+        assert!(p.is_empty() && w.is_empty());
+        let (_, w2) = resolve_buy_candidates(&db, roles::Role::Seller, 2, "widget");
+        assert_eq!(w2.len(), 1);
+    }
+
+    #[test]
+    fn buy_resolution_global_namespace_admin_owner_only() {
+        // The global (seller_id = 0) namespace — legacy rows and admin-created
+        // catalogue entries — is resolvable only by Admin/Owner (B5).
+        let (_d, db) = buy_db();
+        db.add_plan(0, "legacy", "3", "USDT", 30, None);
+        let (p_user, _) = resolve_buy_candidates(&db, roles::Role::User, 7, "legacy");
+        assert!(
+            p_user.is_empty(),
+            "plain users cannot resolve the global namespace"
+        );
+        let (p_seller, _) = resolve_buy_candidates(&db, roles::Role::Seller, 1, "legacy");
+        assert!(
+            p_seller.is_empty(),
+            "sellers cannot resolve the global namespace"
+        );
+        let (p_admin, _) = resolve_buy_candidates(&db, roles::Role::Admin, 1, "legacy");
+        assert_eq!(p_admin.len(), 1);
+        assert_eq!(p_admin[0].6, 0);
+        let (p_owner, _) = resolve_buy_candidates(&db, roles::Role::Owner, 1, "legacy");
+        assert_eq!(p_owner.len(), 1);
+    }
+
+    #[test]
+    fn buy_resolution_plain_user_shop_fallback_excludes_global() {
+        // Public-mode /buy (README "Two modes"): a plain buyer falls back to
+        // the cross-seller active shop view, minus the global namespace,
+        // and the Owner may resolve any seller's entry by name.
+        let (_d, db) = buy_db();
+        db.add_plan(1, "vip", "9", "USDT", 30, None);
+        db.add_plan(0, "gplan", "1", "USDT", 7, None);
+        let (p, _) = resolve_buy_candidates(&db, roles::Role::User, 42, "vip");
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].6, 1);
+        let (g, _) = resolve_buy_candidates(&db, roles::Role::User, 42, "gplan");
+        assert!(
+            g.is_empty(),
+            "global namespace excluded from the shop fallback"
+        );
+        // Owner superuser ("owner can" in the review's test spec): any seller.
+        let (o, _) = resolve_buy_candidates(&db, roles::Role::Owner, 999, "vip");
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].6, 1);
+    }
+
+    #[test]
+    fn buy_resolution_ambiguous_name_still_reports_both() {
+        // Seller-disambiguation syntax is deferred (v1.2 record): an
+        // ambiguous name for a plain buyer returns multiple candidates so the
+        // handler errors out instead of silently picking one.
+        let (_d, db) = buy_db();
+        db.add_plan(1, "dup", "1", "USDT", 7, None);
+        db.add_plan(2, "dup", "2", "TON", 7, None);
+        let (p, _) = resolve_buy_candidates(&db, roles::Role::User, 42, "dup");
+        assert_eq!(p.len(), 2);
+        // A seller with their own "dup" is never ambiguous: own namespace wins.
+        db.add_plan(1, "dup", "3", "USDT", 7, None);
+        let (p1, _) = resolve_buy_candidates(&db, roles::Role::Seller, 1, "dup");
+        assert_eq!(p1.len(), 1);
+        assert_eq!(p1[0].1, "3");
     }
 }

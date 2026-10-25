@@ -13,6 +13,7 @@ pub mod dialogue;
 pub mod embed;
 pub mod handlers;
 pub mod mcp;
+pub mod metrics;
 pub mod roles;
 pub mod services;
 pub mod util;

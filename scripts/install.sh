@@ -200,6 +200,17 @@ fi
 
 # 6. systemd (or run instructions).
 if have_systemd && [[ "$NO_SYSTEMD" == "0" ]]; then
+  # Write-path reasoning: ProtectSystem=strict mounts the whole filesystem
+  # hierarchy read-only EXCEPT the API-emulated /dev, so the service needs an
+  # explicit ReadWritePaths for every directory it writes: the data dir
+  # ($DATA_DIR: agent.db + WAL) and $PREFIX — the web setup flow REWRITES
+  # $PREFIX/.env (web.rs setup_submit std::fs::write), so under 'strict' that
+  # write fails without $PREFIX in ReadWritePaths. If that flow moves its
+  # writes to the data dir, drop $PREFIX here to shrink the writable surface
+  # again. ProtectHome=true makes /home, /root, /run/user inaccessible
+  # outright — ReadWritePaths CANNOT override it, so an operator pointing
+  # --data-dir under $HOME must also drop ProtectHome (the default
+  # /var/lib/telegram-agent needs nothing extra).
   cat > "/etc/systemd/system/${SERVICE}.service" <<EOF
 [Unit]
 Description=Telegram Business Platform
@@ -221,10 +232,13 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=$DATA_DIR
+ReadWritePaths=$DATA_DIR $PREFIX
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
+# Cap the task count (tokio worker + request tasks stay far below this); the
+# systemd directive is TasksMax= — there is no "KernelTasksMax=".
+TasksMax=256
 
 [Install]
 WantedBy=multi-user.target

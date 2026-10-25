@@ -1,11 +1,13 @@
 use axum::{
     Router,
-    extract::{Form, Path, State},
-    http::header,
-    response::{Html, IntoResponse, Redirect},
+    extract::{Form, Path, Request, State},
+    http::{StatusCode, header},
+    middleware::Next,
+    response::{Html, IntoResponse, Json, Redirect, Response},
     routing::{get, post},
 };
 use serde::Deserialize;
+use serde_json::json;
 use std::sync::Arc;
 use teloxide::{Bot, prelude::*};
 use tower_http::services::ServeDir;
@@ -155,6 +157,38 @@ pub fn mount(base: &str, router: Router) -> Router {
     Router::new()
         .nest(base, router)
         .route(&trailing, get(move || async move { Redirect::to(&target) }))
+}
+
+// ---- Request timeout (control-plane hardening, L8; zero new deps) ----
+
+/// Production ceiling for any request on the merged router. Generous by
+/// design: dashboard/API/MCP handlers do SQLite writes and awaited Telegram
+/// sends (each with its own client timeout), the bot long-poll runs in the
+/// dispatcher task — never through axum — and the cryptopay webhook only
+/// performs two DB writes, so nothing legitimate needs 30s.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout middleware applied in `main.rs` around the merged router. On
+/// elapse the handler future is dropped (its side effects so far stand —
+/// SQLite writes are transactional) and a 503 in the API error envelope is
+/// returned.
+pub async fn request_timeout(req: Request, next: Next) -> Response {
+    run_with_timeout(REQUEST_TIMEOUT, req, next).await
+}
+
+/// Parameterized core so tests exercise the real logic with a short limit
+/// instead of sleeping 30s.
+pub(crate) async fn run_with_timeout(limit: Duration, req: Request, next: Next) -> Response {
+    match tokio::time::timeout(limit, next.run(req)).await {
+        Ok(resp) => resp,
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": {"code": "timeout", "message": "request exceeded the time limit and was aborted"}
+            })),
+        )
+            .into_response(),
+    }
 }
 
 fn html_page(base: &str, title: &str, body: &str) -> String {
@@ -378,7 +412,7 @@ async fn login_submit(
             .into_response();
     }
     if let Some((account_id, role, seller_id)) =
-        state.db.verify_web_password(&f.username, &f.password)
+        state.db.verify_web_password(&f.username, &f.password).await
     {
         login_ok(&state.login_attempts, &f.username);
         let token = state.db.create_web_session(account_id, &role, seller_id, 7);
@@ -1062,7 +1096,10 @@ async fn setup_submit(
 
     // Seed owner web account + channel in DB.
     if state.db.get_web_account_by_username(&uname).is_none() {
-        let _ = state.db.create_web_account(&uname, &pw, "owner", None);
+        let _ = state
+            .db
+            .create_web_account(&uname, &pw, "owner", None)
+            .await;
     }
     if let Some(c) = &channel {
         state.db.set_config("channel", c);
@@ -1137,11 +1174,12 @@ mod tests {
         }
     }
 
-    fn make_state() -> (WebState, TempDir) {
+    async fn make_state() -> (WebState, TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let db = Db::new(db_path.to_str().unwrap()).unwrap();
         db.create_web_account("owner", "secret", "owner", None)
+            .await
             .unwrap();
         let cfg = Config {
             bot_token: "0:dummy".to_string(),
@@ -1175,7 +1213,7 @@ mod tests {
 
     #[tokio::test]
     async fn unauth_dashboard_redirects_to_login() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let app = router(state);
         let req = Request::builder()
             .uri("/dashboard")
@@ -1188,7 +1226,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_valid_sets_cookie_and_redirects() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let app = router(state);
         let req = Request::builder()
             .method("POST")
@@ -1205,7 +1243,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_invalid_returns_error() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let app = router(state);
         let req = Request::builder()
             .method("POST")
@@ -1221,7 +1259,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_dashboard_returns_200() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let db = state.db.clone();
         let (acc_id, _u, _h, _r, _s) = db.get_web_account_by_username("owner").unwrap();
         let token = db.create_web_session(acc_id, "owner", None, 7);
@@ -1237,7 +1275,7 @@ mod tests {
 
     #[tokio::test]
     async fn logout_clears_session() {
-        let (state, _dir) = make_state();
+        let (state, _dir) = make_state().await;
         let db = state.db.clone();
         let (acc_id, _u, _h, _r, _s) = db.get_web_account_by_username("owner").unwrap();
         let token = db.create_web_session(acc_id, "owner", None, 7);
@@ -1252,5 +1290,67 @@ mod tests {
         let set_cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
         assert!(set_cookie.contains("Max-Age=0"));
         assert!(db.get_web_session(&token).is_none());
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    // Timeout middleware tests (L8). The production ceiling is 30s; the
+    // tests exercise the real `run_with_timeout` logic with a short limit so
+    // nothing sleeps 30 seconds. No sleep route exists in production code —
+    // these live only inside this test module.
+    use super::*;
+    use axum::body::Body;
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    async fn slow() -> &'static str {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        "done"
+    }
+    async fn fast() -> &'static str {
+        "ok"
+    }
+
+    fn app(limit: Duration) -> Router {
+        Router::new()
+            .route("/slow", get(slow))
+            .route("/fast", get(fast))
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                run_with_timeout(limit, req, next).await
+            }))
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_503_envelope() {
+        let resp = app(Duration::from_millis(50))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/slow")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["code"], "timeout");
+    }
+
+    #[tokio::test]
+    async fn fast_handlers_pass_through_untimed() {
+        let resp = app(Duration::from_millis(2000))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/fast")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

@@ -14,10 +14,45 @@ use telegram_agent::{
     dialogue::State,
     expire_subscriptions, handlers,
     handlers::registry::{CommandContext, CommandRegistry},
-    mcp, roles, services, util, web,
+    mcp, metrics, roles, services, util, web,
 };
 
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+/// Bounded retries for background jobs (2026-10-25 review: "leaving for
+/// retry" forever). After this many FAILED VERIFICATION/SEND attempts the
+/// item is marked terminal-failed instead of being re-queued. A "not settled
+/// yet" invoice release does NOT count — a buyer may legitimately pay days
+/// later; only verification errors and misconfigurations age out.
+const VERIFY_ATTEMPT_CAP: i64 = 10;
+const POST_ATTEMPT_CAP: i64 = 10;
+
+/// Record one failed verification attempt for an invoice and, at the cap,
+/// move it to the terminal 'failed' state (pending_invoices() no longer
+/// returns it), log loudly, and audit. Returns the new attempt count so the
+/// caller can log bounded-retry context. A degraded counter (0) reads as
+/// "never capped" — identical to the previous retry-forever behavior.
+fn bump_invoice_failure(db: &Db, inv_id: &str, reason: &str) -> i64 {
+    let attempts = db.bump_invoice_attempts(inv_id);
+    if attempts >= VERIFY_ATTEMPT_CAP {
+        db.update_invoice_status(inv_id, "failed");
+        tracing::error!(
+            "invoice {} failed terminally after {} verification attempts ({}); restore manually via the admin invoice-status API if needed",
+            inv_id,
+            attempts,
+            reason
+        );
+        db.log_action(
+            0,
+            "system",
+            "invoice_verify_failed",
+            "invoice",
+            inv_id,
+            Some(&format!("attempts={} reason={}", attempts, reason)),
+        );
+    }
+    attempts
+}
 
 #[tokio::main]
 async fn main() {
@@ -25,6 +60,8 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
+    // Pin the metrics uptime gauge to process start (L8 observability).
+    metrics::note_process_start();
 
     let cfg = Config::from_env();
     if !cfg.is_configured() {
@@ -55,7 +92,7 @@ async fn main() {
                     pw
                 });
             if db.get_web_account_by_username(&uname).is_none()
-                && let Err(e) = db.create_web_account(&uname, &pw, "owner", None)
+                && let Err(e) = db.create_web_account(&uname, &pw, "owner", None).await
             {
                 tracing::warn!("failed to seed owner web account: {}", e);
             }
@@ -159,10 +196,19 @@ async fn main() {
                     let cp = match cp {
                         Some(c) => c,
                         None => {
-                            tracing::warn!(
-                                "invoice {} claimed but no crypto token configured; leaving for retry",
-                                inv_id
-                            );
+                            // Bounded retry (VERIFY_ATTEMPT_CAP): a missing
+                            // token is a permanent misconfiguration, not a
+                            // transient condition — age the invoice out.
+                            let attempts =
+                                bump_invoice_failure(&db_bg, &inv_id, "no crypto token configured");
+                            if attempts < VERIFY_ATTEMPT_CAP {
+                                tracing::warn!(
+                                    "invoice {} claimed but no crypto token configured; leaving for retry (attempt {}/{})",
+                                    inv_id,
+                                    attempts,
+                                    VERIFY_ATTEMPT_CAP
+                                );
+                            }
                             continue;
                         }
                     };
@@ -170,11 +216,22 @@ async fn main() {
                     let v = match cp.get_invoice(&inv_id).await {
                         Ok(v) => v,
                         Err(e) => {
-                            tracing::warn!(
-                                "invoice {} verification failed: {}; leaving for retry",
-                                inv_id,
-                                e
+                            // Bounded retry: N consecutive provider errors
+                            // age the invoice out instead of looping forever.
+                            let attempts = bump_invoice_failure(
+                                &db_bg,
+                                &inv_id,
+                                &format!("provider verification error: {}", e),
                             );
+                            if attempts < VERIFY_ATTEMPT_CAP {
+                                tracing::warn!(
+                                    "invoice {} verification failed: {}; leaving for retry (attempt {}/{})",
+                                    inv_id,
+                                    e,
+                                    attempts,
+                                    VERIFY_ATTEMPT_CAP
+                                );
+                            }
                             continue;
                         }
                     };
@@ -284,11 +341,22 @@ async fn main() {
                     if ch.is_empty() {
                         // Paid but not grantable yet: leave the claim so the
                         // next cycle retries once a channel is configured.
-                        tracing::warn!(
-                            "invoice {} paid but no channel resolvable for seller {}; leaving for retry",
-                            inv_id,
-                            seller_id
+                        // Bounded retry: an unresolvable channel is a
+                        // misconfiguration, not a buyer-side condition.
+                        let attempts = bump_invoice_failure(
+                            &db_bg,
+                            &inv_id,
+                            &format!("no channel resolvable for seller {}", seller_id),
                         );
+                        if attempts < VERIFY_ATTEMPT_CAP {
+                            tracing::warn!(
+                                "invoice {} paid but no channel resolvable for seller {}; leaving for retry (attempt {}/{})",
+                                inv_id,
+                                seller_id,
+                                attempts,
+                                VERIFY_ATTEMPT_CAP
+                            );
+                        }
                         continue;
                     }
                     let sub_id = db_bg.create_subscription(
@@ -312,10 +380,20 @@ async fn main() {
                         .await
                         .ok()
                         .map(|l| l.invite_link);
-                    if let Some(l) = link
-                        && let Err(e) = bot_bg.send_message(teloxide::types::ChatId(target_user), format!("Payment confirmed. Access granted.\\nInvite: {}\\nSubscription #{}", l, sub_id)).await {
-                            tracing::warn!("failed to send grant message: {}", e);
+                    if let Some(l) = link {
+                        // Metrics hook only (L8): bot_messages_sent_total on
+                        // the success arm.
+                        match bot_bg
+                            .send_message(
+                                teloxide::types::ChatId(target_user),
+                                format!("Payment confirmed. Access granted.\\nInvite: {}\\nSubscription #{}", l, sub_id),
+                            )
+                            .await
+                        {
+                            Err(e) => tracing::warn!("failed to send grant message: {}", e),
+                            Ok(_) => metrics::bot_sent(),
                         }
+                    }
                     // (f) Terminal: verified paid + granted.
                     db_bg.finalize_invoice_paid(&inv_id);
                 }
@@ -353,9 +431,33 @@ async fn main() {
                             let _ =
                                 db_bg.log_post(seller_id, &chat_id, sent.id.0, &kind, Some(&text));
                             tracing::info!("scheduled post {} posted", id);
+                            // Metrics hook only (L8): bot_messages_sent_total.
+                            metrics::bot_sent();
                         }
                         Err(e) => {
-                            tracing::warn!("failed to post scheduled {}: {}", id, e);
+                            // Bounded retry (POST_ATTEMPT_CAP): at the cap
+                            // the post goes terminal-failed and leaves the
+                            // due queue instead of retrying forever. Send
+                            // failures are matched, never unwrapped — a
+                            // broken chat must not panic the worker.
+                            let attempts = db_bg.bump_scheduled_attempts(id);
+                            if attempts >= POST_ATTEMPT_CAP {
+                                db_bg.mark_scheduled_failed(id);
+                                tracing::error!(
+                                    "scheduled post {} failed terminally after {} send attempts: {}",
+                                    id,
+                                    attempts,
+                                    e
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "failed to post scheduled {} (attempt {}/{}): {}",
+                                    id,
+                                    attempts,
+                                    POST_ATTEMPT_CAP,
+                                    e
+                                );
+                            }
                         }
                     }
                 }
@@ -494,7 +596,18 @@ async fn main() {
     let api_router = api::router(web_state.clone());
     let web_router = web::mount(
         &base,
-        web_router.merge(api_router).merge(mcp::router(web_state)),
+        web_router
+            .merge(api_router)
+            .merge(mcp::router(web_state))
+            // 30s request ceiling for the whole control plane (L8). The bot
+            // long-poll never passes through axum and the cryptopay webhook
+            // is two DB writes, so nothing legitimate needs longer (see
+            // web::REQUEST_TIMEOUT).
+            .layer(axum::middleware::from_fn(web::request_timeout))
+            // HTTP metrics outermost, so requests aborted by the timeout
+            // layer are still counted (status_class="5xx"); labels come from
+            // the matched route template only (see src/metrics.rs).
+            .layer(axum::middleware::from_fn(metrics::track_http)),
     );
     let web_port: u16 = cfg.web_port();
     let web_bind = cfg.web_bind();
@@ -536,6 +649,14 @@ async fn main() {
         } => { tracing::info!("bot task ended"); }
         _ = web_task => { tracing::info!("web task ended"); }
     }
+    // Flush the WAL into the main database file before exiting
+    // (PRAGMA wal_checkpoint(TRUNCATE)) so backups and file copies see a
+    // complete database instead of a main file plus a trailing -wal log.
+    // `db` is still owned here — only clones moved into tasks/states — and
+    // the background loops are parked in sleeps by the time a signal lands,
+    // so the checkpoint normally runs uncontended. Best-effort: failures are
+    // logged inside Db::checkpoint and never fatal.
+    db.checkpoint();
     // Cancel remaining tasks.
     // (tasks are dropped on select exit; nothing further to do)
 }

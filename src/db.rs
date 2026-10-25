@@ -23,9 +23,11 @@ type InvoiceRow = (
     Option<i64>,
     i64,
 );
-type PlanRow = (String, String, String, i64, Option<String>, bool, i64);
-type PlanGlobalRow = (i64, i64, String, String, String, i64, Option<String>);
-type ProductRow = (
+// Row aliases used across pub fn signatures; pub so other modules can name
+// them (the /buy resolver in handlers::commands returns these verbatim).
+pub type PlanRow = (String, String, String, i64, Option<String>, bool, i64);
+pub type PlanGlobalRow = (i64, i64, String, String, String, i64, Option<String>);
+pub type ProductRow = (
     i64,
     i64,
     String,
@@ -104,6 +106,10 @@ type McpApprovalRow = (
 );
 type McpAuditRow = (i64, String, String, bool, Option<String>, String);
 
+// Invariant: every lock of `conn` recovers from poisoning via
+// `.unwrap_or_else(|poisoned| poisoned.into_inner())` — a panic in one caller
+// must never turn into a permanent lock failure for every other caller
+// (background jobs, bot, web). Never `.unwrap()` this mutex.
 pub struct Db {
     conn: Mutex<Connection>,
 }
@@ -130,13 +136,19 @@ impl Db {
 
     fn init_schema(&self) -> Result<(), rusqlite::Error> {
         let schema = include_str!("../schema.sql");
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute_batch(schema)?;
         Ok(())
     }
 
     fn migrate(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // ensure seller columns exist in older dbs (best-effort)
         let _ = conn.execute(
             "ALTER TABLE plans ADD COLUMN seller_id INTEGER NOT NULL DEFAULT 0",
@@ -286,6 +298,21 @@ impl Db {
         if invoices_has_product_id.is_none() {
             let _ = conn.execute("ALTER TABLE invoices ADD COLUMN product_id INTEGER", []);
         }
+        // Retry-cap counters (2026-10-25 review, "leaving for retry" forever):
+        // the invoice verifier and the scheduled-post sender need a bounded
+        // number of attempts with a terminal state. A COLUMN (not an in-memory
+        // map keyed by invoice id) so the cap survives restarts — an
+        // in-memory counter would give a poison invoice a fresh budget every
+        // restart. Additive + idempotent in the house pattern; DEFAULT 0
+        // back-fills existing rows, so no INSERT site changes.
+        let _ = conn.execute(
+            "ALTER TABLE invoices ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE scheduled_posts ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         // One subscription per invoice: guards against double-granting. If
         // historical duplicate grants exist the index cannot be created --
         // warn and continue (never fail startup over it).
@@ -295,6 +322,94 @@ impl Db {
         ) {
             tracing::warn!(
                 "cannot enforce one-subscription-per-invoice (duplicate historical grants?): {}",
+                e
+            );
+        }
+        // Plan namespace uniqueness on (seller_id, name) — 2026-10-25 review
+        // HIGH. Fresh databases declare UNIQUE(seller_id, name) in schema.sql;
+        // legacy databases only got plans.seller_id via
+        // ALTER ... DEFAULT 0 below, so same-name plans inside ONE seller's
+        // namespace can exist there. seller_id is NOT NULL DEFAULT 0: 0 is the
+        // admin/owner global namespace, NULL cannot be stored.
+        //
+        // Dedupe first, keeping the LOWEST id per (seller_id, name) like the
+        // invoice unique-index remediation: subscriptions and activation
+        // codes pointing at a dropped duplicate are re-pointed first so no
+        // reference orphans, then the duplicates are deleted (warn with
+        // counts). Only then create the unique index — skipped entirely when
+        // the schema-level constraint already provides it (pragma_index_list
+        // origin 'u'), so fresh databases don't carry a redundant index on
+        // the plan-insert path. As with every migration here: a failure
+        // warns and continues; startup never fails over it.
+        let dup_groups: Vec<(i64, String, i64)> = match conn.prepare(
+            "SELECT seller_id, name, COUNT(*) FROM plans GROUP BY seller_id, name HAVING COUNT(*) > 1",
+        ) {
+            Ok(mut stmt) => match stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            }) {
+                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                Err(_) => Vec::new(),
+            },
+            Err(e) => {
+                tracing::warn!("plan namespace dedupe check skipped: {}", e);
+                Vec::new()
+            }
+        };
+        for (seller_id, name, count) in dup_groups {
+            let keep: Option<i64> = conn
+                .query_row(
+                    "SELECT MIN(id) FROM plans WHERE seller_id=?1 AND name=?2",
+                    params![seller_id, name],
+                    |r| r.get(0),
+                )
+                .ok();
+            let Some(keep) = keep else {
+                continue;
+            };
+            // Re-point references before deleting so plan joins never orphan.
+            let subs = conn.execute(
+                "UPDATE subscriptions SET plan_id=?3 WHERE plan_id IN (SELECT id FROM plans WHERE seller_id=?1 AND name=?2 AND id != ?3)",
+                params![seller_id, name, keep],
+            );
+            let codes = conn.execute(
+                "UPDATE activation_codes SET plan_id=?3 WHERE plan_id IN (SELECT id FROM plans WHERE seller_id=?1 AND name=?2 AND id != ?3)",
+                params![seller_id, name, keep],
+            );
+            let deleted = conn.execute(
+                "DELETE FROM plans WHERE seller_id=?1 AND name=?2 AND id != ?3",
+                params![seller_id, name, keep],
+            );
+            tracing::warn!(
+                "plan namespace: seller {} plan '{}' had {} rows; kept lowest id {}, removed {}, re-pointed {} subscription(s) and {} activation code(s)",
+                seller_id,
+                name,
+                count,
+                keep,
+                deleted.unwrap_or(0),
+                subs.unwrap_or(0),
+                codes.unwrap_or(0),
+            );
+        }
+        let table_unique_constraint: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_index_list('plans') WHERE \"unique\"=1 AND origin='u'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(1); // assume the constraint exists on probe failure: creating a
+        // redundant index is harmless, dropping uniqueness is not
+        if table_unique_constraint == 0
+            && let Err(e) = conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_plans_seller_name ON plans(seller_id, name)",
+                [],
+            )
+        {
+            tracing::warn!(
+                "cannot enforce per-seller plan name uniqueness (duplicate rows above?): {}",
                 e
             );
         }
@@ -339,8 +454,30 @@ impl Db {
         Ok(())
     }
 
+    /// Fold the WAL back into the main database file
+    /// (PRAGMA wal_checkpoint(TRUNCATE)). Called once on the shutdown path so
+    /// backups / file copies see a complete database instead of a main file
+    /// plus a trailing -wal log. Best-effort by contract: errors are logged,
+    /// never panicked — a checkpoint failure must not turn shutdown into a
+    /// crash (the next startup replays the WAL regardless).
+    pub fn checkpoint(&self) {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // wal_checkpoint always returns exactly one (busy, log, checkpointed)
+        // row, so query_row is the deterministic way to run it; execute_batch
+        // would swallow the row.
+        if let Err(e) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+            tracing::warn!("WAL checkpoint failed (non-fatal): {}", e);
+        }
+    }
+
     pub fn get_config(&self, key: &str) -> Option<String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT value FROM config WHERE key = ?1",
             params![key],
@@ -352,7 +489,10 @@ impl Db {
     }
 
     pub fn set_config(&self, key: &str, value: &str) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "INSERT INTO config(key,value,updated_at) VALUES(?1,?2,?3)
@@ -368,7 +508,10 @@ impl Db {
         username: Option<&str>,
         default_channel: Option<&str>,
     ) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "INSERT INTO sellers(user_id,username,default_channel,created_at) VALUES(?1,?2,?3,?4)
@@ -378,7 +521,10 @@ impl Db {
     }
 
     pub fn get_seller(&self, user_id: i64) -> Option<(i64, Option<String>, Option<String>)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT user_id, username, default_channel FROM sellers WHERE user_id = ?1",
             params![user_id],
@@ -398,7 +544,10 @@ impl Db {
     }
 
     pub fn list_sellers(&self) -> Vec<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = match conn.prepare("SELECT user_id FROM sellers") {
             Ok(s) => s,
             Err(_) => return vec![],
@@ -419,7 +568,10 @@ impl Db {
         kind: &str,
         content: Option<&str>,
     ) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO posts(seller_id,chat_id,message_id,kind,content,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
@@ -429,7 +581,10 @@ impl Db {
     }
 
     pub fn list_posts(&self, seller_scope: Option<i64>, limit: i64) -> Vec<PostRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) =
             seller_scope
         {
@@ -466,13 +621,19 @@ impl Db {
     }
 
     pub fn delete_post(&self, id: i64) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute("DELETE FROM posts WHERE id=?1", params![id])?;
         Ok(())
     }
 
     pub fn update_post_content(&self, id: i64, content: &str) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute(
             "UPDATE posts SET content=?1 WHERE id=?2",
             params![content, id],
@@ -489,7 +650,10 @@ impl Db {
         kind: impl AsRef<str>,
         scheduled_at: impl AsRef<str>,
     ) -> i64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "INSERT INTO scheduled_posts(seller_id,chat_id,content,kind,scheduled_at,status,created_at) VALUES(?1,?2,?3,?4,?5,'pending',?6)",
@@ -506,7 +670,10 @@ impl Db {
     }
 
     pub fn list_due_scheduled(&self) -> Vec<ScheduledPostRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let mut stmt = match conn.prepare(
             "SELECT id,seller_id,chat_id,content,kind,scheduled_at,status,created_at,posted_message_id FROM scheduled_posts WHERE status='pending' AND scheduled_at <= ?1 ORDER BY scheduled_at",
@@ -540,7 +707,10 @@ impl Db {
         id: impl Into<i64>,
         message_id: impl std::fmt::Display,
     ) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mid: i64 = message_id.to_string().parse().unwrap_or(0);
         conn.execute(
             "UPDATE scheduled_posts SET status='posted', posted_message_id=?2 WHERE id=?1",
@@ -549,8 +719,45 @@ impl Db {
         Ok(())
     }
 
+    /// Bump and return the send-attempts counter of a scheduled post. Used by
+    /// the sender loop to bound retries: at the cap the post is marked
+    /// 'failed' (terminal — list_due_scheduled only returns 'pending').
+    /// Returns 0 on any error, which reads as "not capped": a degraded
+    /// counter degrades to today's retry-forever behavior, never to a
+    /// spurious failure.
+    pub fn bump_scheduled_attempts(&self, id: i64) -> i64 {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "UPDATE scheduled_posts SET attempts = attempts + 1 WHERE id = ?1 RETURNING attempts",
+            params![id],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// Terminal-fail a scheduled post after the retry cap. Scoped to
+    /// status='pending' so a concurrently-posted row is never overwritten.
+    pub fn mark_scheduled_failed(&self, id: i64) {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(e) = conn.execute(
+            "UPDATE scheduled_posts SET status='failed' WHERE id=?1 AND status='pending'",
+            params![id],
+        ) {
+            tracing::warn!("failed to mark scheduled post {} as failed: {}", id, e);
+        }
+    }
+
     pub fn list_scheduled_posts(&self, seller_scope: Option<i64>) -> Vec<ScheduledPostRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) =
             seller_scope
         {
@@ -595,7 +802,10 @@ impl Db {
     }
 
     pub fn get_user(&self, user_id: i64) -> Option<(i64, Option<String>)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT user_id, username FROM users WHERE user_id=?1",
             params![user_id],
@@ -621,7 +831,10 @@ impl Db {
         user_id: Option<i64>,
         product_id: Option<i64>,
     ) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "INSERT INTO invoices(invoice_id,seller_id,amount,asset,description,status,pay_url,plan_id,user_id,product_id,created_at,updated_at)
@@ -632,7 +845,10 @@ impl Db {
     }
 
     pub fn update_invoice_status(&self, invoice_id: &str, status: &str) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "UPDATE invoices SET status=?1, updated_at=?2 WHERE invoice_id=?3",
@@ -640,8 +856,34 @@ impl Db {
         );
     }
 
+    /// Bump and return the verification-attempts counter of an invoice. The
+    /// counter advances ONLY on verification errors (no token configured,
+    /// provider error, unresolvable channel) — the "not settled yet" release
+    /// does not count, so a buyer who pays days later is never aged out. At
+    /// the cap the caller marks the invoice terminal-failed ('failed':
+    /// pending_invoices() filters it out; reversible only by an operator via
+    /// the admin invoice-status API). Returns 0 on any error, which reads as
+    /// "not capped": a degraded counter degrades to retry-forever behavior,
+    /// never to a spurious terminal failure.
+    pub fn bump_invoice_attempts(&self, invoice_id: &str) -> i64 {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.query_row(
+            "UPDATE invoices SET attempts = attempts + 1, updated_at=?2 WHERE invoice_id = ?1 RETURNING attempts",
+            params![invoice_id, now],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+    }
+
     pub fn get_invoice(&self, invoice_id: &str) -> Option<InvoiceRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT amount,asset,status,COALESCE(description,''),plan_id,user_id,seller_id FROM invoices WHERE invoice_id=?1",
             params![invoice_id],
@@ -652,7 +894,10 @@ impl Db {
     /// Product bound to an invoice (NULL = plan path). Reads the v1.2
     /// `product_id` column added by migrate().
     pub fn invoice_product(&self, invoice_id: &str) -> Option<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT product_id FROM invoices WHERE invoice_id=?1",
             params![invoice_id],
@@ -669,7 +914,10 @@ impl Db {
         &self,
         invoice_id: &str,
     ) -> Option<(i64, String, String, Option<String>)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT p.id, p.kind, p.name, p.delivery FROM invoices i JOIN products p ON p.id = i.product_id WHERE i.invoice_id=?1",
             params![invoice_id],
@@ -684,7 +932,10 @@ impl Db {
     /// only if no other granter got there first. Serializes concurrent
     /// granters at the DB level.
     pub fn claim_invoice_for_grant(&self, invoice_id: &str) -> bool {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute(
             "UPDATE invoices SET status='granting' WHERE invoice_id=?1 AND status='active'",
             params![invoice_id],
@@ -694,7 +945,10 @@ impl Db {
     /// Mark a claimed invoice as fully granted/paid. Best-effort: errors are
     /// logged, not swallowed silently.
     pub fn finalize_invoice_paid(&self, invoice_id: &str) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         if let Err(e) = conn.execute(
             "UPDATE invoices SET status='paid', updated_at=?2 WHERE invoice_id=?1",
@@ -705,7 +959,10 @@ impl Db {
     }
 
     pub fn subscription_exists_for_invoice(&self, invoice_id: &str) -> bool {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT 1 FROM subscriptions WHERE invoice_id=?1 LIMIT 1",
             params![invoice_id],
@@ -720,7 +977,10 @@ impl Db {
     /// Invoices still awaiting (or mid-) grant. Includes 'granting' so a crash
     /// after claim re-queues the stuck grant instead of losing it.
     pub fn pending_invoices(&self) -> Vec<(String, Option<String>, Option<i64>, i64)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = match conn.prepare("SELECT invoice_id, plan_id, user_id, seller_id FROM invoices WHERE status IN ('active','granting') AND plan_id IS NOT NULL") { Ok(s)=>s, Err(_)=>return vec![] };
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
@@ -736,7 +996,10 @@ impl Db {
         seller_scope: Option<i64>,
         limit: i64,
     ) -> Vec<(String, String, String, String, String)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) =
             seller_scope
         {
@@ -775,7 +1038,10 @@ impl Db {
         if user_id == owner_id {
             return true;
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT 1 FROM admins WHERE user_id = ?1",
             params![user_id],
@@ -788,7 +1054,10 @@ impl Db {
     }
 
     pub fn add_admin(&self, user_id: i64, username: Option<&str>) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "INSERT OR IGNORE INTO admins(user_id,username,added_at) VALUES(?1,?2,?3)",
@@ -797,12 +1066,18 @@ impl Db {
     }
 
     pub fn remove_admin(&self, user_id: i64) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = conn.execute("DELETE FROM admins WHERE user_id = ?1", params![user_id]);
     }
 
     pub fn list_admins(&self) -> Vec<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = match conn.prepare("SELECT user_id FROM admins") {
             Ok(s) => s,
             Err(_) => return vec![],
@@ -815,7 +1090,10 @@ impl Db {
     }
 
     pub fn list_admins_detail(&self) -> Vec<(i64, Option<String>)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = match conn.prepare("SELECT user_id, username FROM admins ORDER BY user_id") {
             Ok(s) => s,
             Err(_) => return vec![],
@@ -841,7 +1119,10 @@ impl Db {
         days: i64,
         channel_id: Option<&str>,
     ) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "INSERT OR REPLACE INTO plans(seller_id,name,price,asset,duration_days,channel_id,active,created_at) VALUES(?1,?2,?3,?4,?5,?6,1,?7)",
@@ -850,7 +1131,10 @@ impl Db {
     }
 
     pub fn remove_plan(&self, seller_id: i64, name: &str) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = conn.execute(
             "DELETE FROM plans WHERE seller_id=?1 AND name=?2",
             params![seller_id, name],
@@ -858,7 +1142,10 @@ impl Db {
     }
 
     pub fn list_plans(&self, seller_scope: Option<i64>) -> Vec<PlanRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) =
             seller_scope
         {
@@ -897,7 +1184,10 @@ impl Db {
         seller_id: i64,
         name: &str,
     ) -> Option<(i64, String, String, String, i64, Option<String>)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT id,price,asset,name,duration_days,channel_id FROM plans WHERE seller_id=?1 AND name=?2",
             params![seller_id, name],
@@ -907,7 +1197,10 @@ impl Db {
 
     pub fn get_plan_global(&self, name: &str) -> Option<PlanGlobalRow> {
         // (seller_id, id, price, asset, name, days, channel)
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT seller_id,id,price,asset,name,duration_days,channel_id FROM plans WHERE name=?1 LIMIT 1",
             params![name],
@@ -919,7 +1212,10 @@ impl Db {
         &self,
         id: i64,
     ) -> Option<(i64, String, String, String, i64, Option<String>)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT seller_id,price,asset,name,duration_days,channel_id FROM plans WHERE id=?1",
             params![id],
@@ -957,7 +1253,10 @@ impl Db {
                 kind
             ));
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Creation-time cross-table name-collision rejection: a name already
         // used by an active plan or product of the same seller cannot be
         // reused (names in other sellers' namespaces are fine).
@@ -1007,7 +1306,10 @@ impl Db {
     }
 
     pub fn get_product(&self, seller_id: i64, name: &str) -> Option<ProductRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT id,seller_id,name,price,asset,kind,delivery,stock,active FROM products WHERE seller_id=?1 AND name=?2",
             params![seller_id, name],
@@ -1018,7 +1320,10 @@ impl Db {
     /// Seller scope shows every row (incl. retired); unscoped listing is the
     /// public shop view, active products only.
     pub fn list_products(&self, seller: Option<i64>) -> Vec<ProductRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) = seller {
             ("SELECT id,seller_id,name,price,asset,kind,delivery,stock,active FROM products WHERE seller_id=?1 ORDER BY id".to_string(), vec![Box::new(sid)])
         } else {
@@ -1053,36 +1358,60 @@ impl Db {
     }
 
     pub fn set_product_active(&self, seller_id: i64, name: &str, active: bool) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = conn.execute(
             "UPDATE products SET active=?3 WHERE seller_id=?1 AND name=?2",
             params![seller_id, name, if active { 1 } else { 0 }],
         );
     }
 
-    /// Cross-seller lookup for /buy name resolution (active products only).
-    pub fn find_products_by_name(&self, name: &str) -> Vec<ProductRow> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare(
-            "SELECT id,seller_id,name,price,asset,kind,delivery,stock,active FROM products WHERE name=?1 AND active=1 ORDER BY id",
-        ) {
+    /// Name lookup for /buy resolution, scoped to the (seller_id, name) plan
+    /// namespace (2026-10-25 review HIGH): `Some(seller_id)` resolves one
+    /// seller's namespace; `None` is the cross-seller active shop view (the
+    /// caller decides which namespaces it may see — the global seller_id=0
+    /// namespace is admin/owner-only, see handlers::commands).
+    pub fn find_products_by_name(&self, seller_scope: Option<i64>, name: &str) -> Vec<ProductRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) =
+            seller_scope
+        {
+            (
+                "SELECT id,seller_id,name,price,asset,kind,delivery,stock,active FROM products WHERE seller_id=?1 AND name=?2 AND active=1 ORDER BY id".to_string(),
+                vec![Box::new(sid), Box::new(name)],
+            )
+        } else {
+            (
+                "SELECT id,seller_id,name,price,asset,kind,delivery,stock,active FROM products WHERE name=?1 AND active=1 ORDER BY id".to_string(),
+                vec![Box::new(name)],
+            )
+        };
+        let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(_) => return vec![],
         };
         let rows = stmt
-            .query_map(params![name], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                    r.get(8)?,
-                ))
-            })
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                },
+            )
             .ok();
         match rows {
             Some(iter) => iter.filter_map(|r| r.ok()).collect(),
@@ -1090,27 +1419,47 @@ impl Db {
         }
     }
 
-    /// Cross-seller plan lookup in list_plans' row shape (active plans only).
-    pub fn find_plans_by_name(&self, name: &str) -> Vec<PlanRow> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare(
-            "SELECT name,price,asset,duration_days,channel_id,active,seller_id FROM plans WHERE name=?1 AND active=1 ORDER BY id",
-        ) {
+    /// Name lookup for /buy resolution, scoped to the (seller_id, name) plan
+    /// namespace (2026-10-25 review HIGH): `Some(seller_id)` resolves one
+    /// seller's namespace (seller_id 0 is the admin/owner global namespace);
+    /// `None` is the cross-seller active view feeding the public shop.
+    pub fn find_plans_by_name(&self, seller_scope: Option<i64>, name: &str) -> Vec<PlanRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) =
+            seller_scope
+        {
+            (
+                "SELECT name,price,asset,duration_days,channel_id,active,seller_id FROM plans WHERE seller_id=?1 AND name=?2 AND active=1 ORDER BY id".to_string(),
+                vec![Box::new(sid), Box::new(name)],
+            )
+        } else {
+            (
+                "SELECT name,price,asset,duration_days,channel_id,active,seller_id FROM plans WHERE name=?1 AND active=1 ORDER BY id".to_string(),
+                vec![Box::new(name)],
+            )
+        };
+        let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(_) => return vec![],
         };
         let rows = stmt
-            .query_map(params![name], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get::<_, i64>(5)? != 0,
-                    r.get(6)?,
-                ))
-            })
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get::<_, i64>(5)? != 0,
+                        r.get(6)?,
+                    ))
+                },
+            )
             .ok();
         match rows {
             Some(iter) => iter.filter_map(|r| r.ok()).collect(),
@@ -1119,7 +1468,10 @@ impl Db {
     }
 
     pub fn product_grant_exists(&self, invoice_id: &str) -> bool {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT 1 FROM product_grants WHERE invoice_id=?1 LIMIT 1",
             params![invoice_id],
@@ -1144,7 +1496,10 @@ impl Db {
         product_id: i64,
         invoice_id: &str,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let exists = conn
             .query_row(
@@ -1190,7 +1545,10 @@ impl Db {
         buyer: i64,
         invoice_id: &str,
     ) -> Result<String, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let order_id = crate::util::gen_token(8);
         conn.execute(
@@ -1208,7 +1566,10 @@ impl Db {
         &self,
         seller: Option<i64>,
     ) -> Vec<(String, i64, i64, String, Option<String>, String)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) = seller {
             (
                 "SELECT order_id,seller_id,buyer_user_id,status,tracking,created_at FROM orders WHERE seller_id=?1 ORDER BY id DESC".to_string(),
@@ -1255,7 +1616,10 @@ impl Db {
         ) {
             return false;
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE orders SET status=?3, updated_at=?4 WHERE seller_id=?1 AND order_id=?2",
@@ -1266,7 +1630,10 @@ impl Db {
     }
 
     pub fn set_order_tracking(&self, seller_id: i64, order_id: &str, tracking: &str) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "UPDATE orders SET tracking=?3, updated_at=?4 WHERE seller_id=?1 AND order_id=?2",
@@ -1286,7 +1653,10 @@ impl Db {
         invoice_id: Option<&str>,
         code_id: Option<i64>,
     ) -> i64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now();
         let starts = now.to_rfc3339();
         // Checked arithmetic: a huge `days` must not panic (neither in
@@ -1308,7 +1678,10 @@ impl Db {
         seller_scope: Option<i64>,
         limit: i64,
     ) -> Vec<(i64, i64, i64, String, String, String)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) =
             seller_scope
         {
@@ -1342,7 +1715,10 @@ impl Db {
     }
 
     pub fn expired_subscriptions(&self) -> Vec<(i64, i64, i64, String)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let mut stmt = match conn.prepare("SELECT id,seller_id,user_id,channel_id FROM subscriptions WHERE status='active' AND expires_at < ?1") { Ok(s)=>s, Err(_)=>return vec![] };
         let rows = stmt
@@ -1357,14 +1733,20 @@ impl Db {
     }
 
     pub fn mark_subscription_expired(&self, id: i64) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = conn.execute(
             "UPDATE subscriptions SET status='expired' WHERE id=?1",
             params![id],
         );
     }
     pub fn subscriptions_for_invoice(&self, invoice_id: &str) -> Vec<(i64, i64, i64, String)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = match conn.prepare(
             "SELECT id,seller_id,user_id,channel_id FROM subscriptions WHERE invoice_id=?1",
         ) {
@@ -1383,7 +1765,10 @@ impl Db {
     }
 
     pub fn set_subscription_status(&self, sub_id: i64, status: &str) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = conn.execute(
             "UPDATE subscriptions SET status=?1 WHERE id=?2",
             params![status, sub_id],
@@ -1393,7 +1778,10 @@ impl Db {
     /// Subscription bound to an invoice: (id, channel_id). Safe with the
     /// one-subscription-per-invoice unique index.
     pub fn subscription_by_invoice(&self, invoice_id: &str) -> Option<(i64, String)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT id, channel_id FROM subscriptions WHERE invoice_id=?1 LIMIT 1",
             params![invoice_id],
@@ -1405,7 +1793,10 @@ impl Db {
     }
 
     pub fn user_has_active_sub(&self, seller_id: i64, user_id: i64, channel_id: &str) -> bool {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         conn.query_row("SELECT 1 FROM subscriptions WHERE seller_id=?1 AND user_id=?2 AND channel_id=?3 AND status='active' AND expires_at > ?4", params![seller_id, user_id, channel_id, now], |r| r.get::<_, i64>(0))
             .optional().ok().flatten().is_some()
@@ -1421,7 +1812,10 @@ impl Db {
         expires_at: Option<&str>,
     ) -> String {
         let code = generate_code();
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "INSERT INTO activation_codes(seller_id,code,plan_id,value_days,max_uses,uses,expires_at,created_at) VALUES(?1,?2,?3,?4,?5,0,?6,?7)",
@@ -1431,7 +1825,10 @@ impl Db {
     }
 
     pub fn get_code(&self, code: &str) -> Option<CodeRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT id,seller_id,plan_id,value_days,max_uses,uses,expires_at FROM activation_codes WHERE code=?1",
             params![code],
@@ -1455,7 +1852,10 @@ impl Db {
         {
             return Err("code expired".to_string());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "UPDATE activation_codes SET uses = uses + 1 WHERE id = ?1",
@@ -1469,7 +1869,10 @@ impl Db {
     }
 
     pub fn list_codes(&self, seller_scope: Option<i64>, limit: i64) -> Vec<CodeListRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) =
             seller_scope
         {
@@ -1504,7 +1907,10 @@ impl Db {
 
     // ---- Users ----
     pub fn upsert_user(&self, user_id: i64, username: Option<&str>) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "INSERT INTO users(user_id,username,first_seen,last_seen) VALUES(?1,?2,?3,?3)
@@ -1514,7 +1920,10 @@ impl Db {
     }
 
     pub fn list_users(&self) -> Vec<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = match conn.prepare("SELECT user_id FROM users") {
             Ok(s) => s,
             Err(_) => return vec![],
@@ -1527,7 +1936,10 @@ impl Db {
     }
 
     pub fn list_users_for_seller(&self, seller_id: i64) -> Vec<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt =
             match conn.prepare("SELECT DISTINCT user_id FROM subscriptions WHERE seller_id=?1") {
                 Ok(s) => s,
@@ -1558,7 +1970,10 @@ impl Db {
         status: &str,
         error_message: Option<&str>,
     ) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "INSERT INTO ai_usage(seller_id,user_id,provider,model,template,prompt_tokens,completion_tokens,total_tokens,estimated_cost,status,error_message,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
@@ -1567,7 +1982,10 @@ impl Db {
     }
 
     pub fn ai_usage_today_tokens(&self, seller_id: i64) -> i64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let today = Utc::now().format("%Y-%m-%d").to_string();
         conn.query_row(
             "SELECT COALESCE(SUM(total_tokens),0) FROM ai_usage WHERE seller_id=?1 AND created_at LIKE ?2",
@@ -1577,7 +1995,10 @@ impl Db {
     }
 
     pub fn ai_usage_summary(&self, seller_id: i64, days: i64) -> Vec<(String, i64, i64)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = match conn.prepare(
             "SELECT substr(created_at,1,10) as d, COALESCE(SUM(total_tokens),0), COUNT(*) FROM ai_usage WHERE seller_id=?1 GROUP BY d ORDER BY d DESC LIMIT ?2",
         ) { Ok(s)=>s, Err(_)=>return vec![] };
@@ -1593,7 +2014,10 @@ impl Db {
     }
 
     pub fn get_seller_ai_settings(&self, seller_id: i64) -> Option<SellerAiSettings> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT ai_provider, ai_model, daily_token_budget, rpm_limit FROM sellers WHERE user_id=?1",
             params![seller_id],
@@ -1610,7 +2034,10 @@ impl Db {
         rpm: Option<i64>,
     ) {
         self.upsert_seller(seller_id, None, None);
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = conn.execute(
             "UPDATE sellers SET ai_provider=COALESCE(?1,ai_provider), ai_model=COALESCE(?2,ai_model), daily_token_budget=COALESCE(?3,daily_token_budget), rpm_limit=COALESCE(?4,rpm_limit) WHERE user_id=?5",
             params![provider, model, budget, rpm, seller_id],
@@ -1626,7 +2053,10 @@ impl Db {
         user_prompt: &str,
         variables: Option<&str>,
     ) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "INSERT INTO ai_templates(seller_id,name,description,system_prompt,user_prompt,variables,active,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,1,?7,?7)
@@ -1636,7 +2066,10 @@ impl Db {
     }
 
     pub fn get_ai_template(&self, seller_id: i64, name: &str) -> Option<AiTemplateRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT name, description, system_prompt, user_prompt, variables FROM ai_templates WHERE seller_id=?1 AND name=?2",
             params![seller_id, name],
@@ -1645,7 +2078,10 @@ impl Db {
     }
 
     pub fn list_ai_templates(&self, seller_id: i64) -> Vec<(String, Option<String>)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = match conn.prepare("SELECT name, description FROM ai_templates WHERE seller_id=?1 AND active=1 ORDER BY name") { Ok(s)=>s, Err(_)=>return vec![] };
         let rows = stmt
             .query_map(params![seller_id], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -1657,7 +2093,10 @@ impl Db {
     }
 
     pub fn delete_ai_template(&self, seller_id: i64, name: &str) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = conn.execute(
             "DELETE FROM ai_templates WHERE seller_id=?1 AND name=?2",
             params![seller_id, name],
@@ -1665,15 +2104,29 @@ impl Db {
     }
 
     // ---- Web accounts ----
-    pub fn create_web_account(
+    // bcrypt at DEFAULT_COST is deliberately CPU-heavy (~100ms per call).
+    // Every hash/verify below runs on tokio's blocking pool (spawn_blocking)
+    // so an async worker is never stalled by password math — login storms
+    // would otherwise freeze the whole runtime (2026-10-25 review). Callers
+    // are async handlers/tasks; the methods are async for exactly that
+    // reason. Behavior is otherwise identical to the former sync versions.
+    pub async fn create_web_account(
         &self,
         username: &str,
         password: &str,
         role: &str,
         seller_id: Option<i64>,
     ) -> Result<(), String> {
-        let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).map_err(|e| e.to_string())?;
-        let conn = self.conn.lock().unwrap();
+        let password = password.to_string();
+        let hash =
+            tokio::task::spawn_blocking(move || bcrypt::hash(&password, bcrypt::DEFAULT_COST))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO web_accounts(username,password_hash,salt,role,seller_id,created_at) VALUES(?1,?2,'',?3,?4,?5)",
@@ -1686,7 +2139,10 @@ impl Db {
         &self,
         username: &str,
     ) -> Option<(i64, String, String, String, Option<i64>)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT id, username, password_hash, role, seller_id FROM web_accounts WHERE username=?1",
             params![username],
@@ -1694,22 +2150,37 @@ impl Db {
         ).optional().ok().flatten()
     }
 
-    pub fn verify_web_password(
+    pub async fn verify_web_password(
         &self,
         username: &str,
         password: &str,
     ) -> Option<(i64, String, Option<i64>)> {
         let (id, _u, hash, role, seller_id) = self.get_web_account_by_username(username)?;
-        if bcrypt::verify(password, &hash).unwrap_or(false) {
+        // Owned copy: spawn_blocking needs 'static, so the &str param cannot
+        // be captured by reference.
+        let password = password.to_string();
+        let ok =
+            tokio::task::spawn_blocking(move || bcrypt::verify(&password, &hash).unwrap_or(false))
+                .await
+                .unwrap_or(false);
+        if ok {
             Some((id, role, seller_id))
         } else {
             None
         }
     }
 
-    pub fn update_web_password(&self, username: &str, password: &str) -> Result<(), String> {
-        let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).map_err(|e| e.to_string())?;
-        let conn = self.conn.lock().unwrap();
+    pub async fn update_web_password(&self, username: &str, password: &str) -> Result<(), String> {
+        let password = password.to_string();
+        let hash =
+            tokio::task::spawn_blocking(move || bcrypt::hash(&password, bcrypt::DEFAULT_COST))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let n = conn
             .execute(
                 "UPDATE web_accounts SET password_hash=?1 WHERE username=?2",
@@ -1723,7 +2194,10 @@ impl Db {
     }
 
     pub fn list_web_accounts(&self) -> Vec<(String, String)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = match conn.prepare("SELECT username, role FROM web_accounts ORDER BY id") {
             Ok(s) => s,
             Err(_) => return vec![],
@@ -1738,7 +2212,10 @@ impl Db {
     }
 
     pub fn list_web_accounts_full(&self) -> Vec<(i64, String, String, Option<i64>)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = match conn
             .prepare("SELECT id, username, role, seller_id FROM web_accounts ORDER BY id")
         {
@@ -1765,7 +2242,10 @@ impl Db {
         &self,
         id: i64,
     ) -> Option<(i64, String, String, String, Option<i64>)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT id, username, password_hash, role, seller_id FROM web_accounts WHERE id=?1",
             params![id],
@@ -1777,14 +2257,25 @@ impl Db {
     }
 
     pub fn delete_web_account(&self, id: i64) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = conn.execute("DELETE FROM web_accounts WHERE id=?1", params![id]);
         let _ = conn.execute("DELETE FROM web_sessions WHERE account_id=?1", params![id]);
     }
 
-    pub fn update_web_password_by_id(&self, id: i64, password: &str) -> Result<(), String> {
-        let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).map_err(|e| e.to_string())?;
-        let conn = self.conn.lock().unwrap();
+    pub async fn update_web_password_by_id(&self, id: i64, password: &str) -> Result<(), String> {
+        let password = password.to_string();
+        let hash =
+            tokio::task::spawn_blocking(move || bcrypt::hash(&password, bcrypt::DEFAULT_COST))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let n = conn
             .execute(
                 "UPDATE web_accounts SET password_hash=?1 WHERE id=?2",
@@ -1817,7 +2308,10 @@ impl Db {
             }
             s
         };
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now();
         let expires = (now + chrono::Duration::days(days)).to_rfc3339();
         let _ = conn.execute(
@@ -1836,7 +2330,10 @@ impl Db {
         for b in bytes.iter() {
             hash.push_str(&format!("{:02x}", b));
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         conn.query_row(
             "SELECT account_id, role, seller_id FROM web_sessions WHERE token_hash=?1 AND expires_at > ?2",
@@ -1854,7 +2351,10 @@ impl Db {
         for b in bytes.iter() {
             hash.push_str(&format!("{:02x}", b));
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = conn.execute(
             "DELETE FROM web_sessions WHERE token_hash=?1",
             params![hash],
@@ -1871,7 +2371,10 @@ impl Db {
         asset: &str,
         reason: Option<&str>,
     ) -> i64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         // best-effort: fall back to the invoice's buyer when user_id unknown
         let user_id = match user_id {
@@ -1909,7 +2412,10 @@ impl Db {
         Option<String>,
         String,
     )> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) =
             seller_scope
         {
@@ -1950,7 +2456,10 @@ impl Db {
 
     pub fn get_refund(&self, id: impl ToString) -> Option<RefundRow> {
         let id = id.to_string().parse::<i64>().ok()?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT id,seller_id,invoice_id,user_id,amount,asset,reason,status,created_at,updated_at,processed_at,processed_by FROM refunds WHERE id=?1",
             params![id],
@@ -1971,7 +2480,10 @@ impl Db {
             Ok(v) => v,
             Err(_) => return,
         };
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let st = status.as_ref();
         let final_status = matches!(st, "processed" | "paid" | "failed");
@@ -2001,7 +2513,10 @@ impl Db {
         asset: &str,
         destination: Option<&str>,
     ) -> i64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "INSERT INTO payouts(seller_id,amount,asset,destination,status,created_at,updated_at) VALUES(?1,?2,?3,?4,'pending',?5,?5)",
@@ -2014,7 +2529,10 @@ impl Db {
         &self,
         seller_scope: Option<i64>,
     ) -> Vec<(i64, i64, String, String, Option<String>, String)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) =
             seller_scope
         {
@@ -2053,7 +2571,10 @@ impl Db {
 
     pub fn get_payout(&self, id: impl ToString) -> Option<PayoutRow> {
         let id = id.to_string().parse::<i64>().ok()?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT id,seller_id,amount,asset,destination,status,created_at,updated_at,processed_at,processed_by FROM payouts WHERE id=?1",
             params![id],
@@ -2074,7 +2595,10 @@ impl Db {
             Ok(v) => v,
             Err(_) => return,
         };
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let st = status.as_ref();
         let final_status = matches!(st, "paid" | "failed" | "processed");
@@ -2106,7 +2630,10 @@ impl Db {
         target_id: impl ToString,
         metadata: Option<&str>,
     ) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "INSERT INTO audit_log(actor_id,actor_role,action,target_type,target_id,metadata,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
@@ -2115,7 +2642,10 @@ impl Db {
     }
 
     pub fn list_audit_log(&self, limit: i64) -> Vec<AuditLogRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = match conn.prepare("SELECT id,actor_id,actor_role,action,target_type,target_id,metadata,created_at FROM audit_log ORDER BY id DESC LIMIT ?1") { Ok(s)=>s, Err(_)=>return vec![] };
         let rows = stmt
             .query_map(params![limit], |r| {
@@ -2161,7 +2691,10 @@ impl Db {
             s
         };
         let prefix = raw.chars().take(8).collect::<String>();
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "INSERT INTO api_keys(account_id,name,key_hash,key_prefix,scopes,revoked,created_at) VALUES(?1,?2,?3,?4,?5,0,?6)",
@@ -2171,7 +2704,10 @@ impl Db {
     }
 
     pub fn get_api_key_by_hash(&self, hash: impl AsRef<str>) -> Option<ApiKeyRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT id,account_id,name,key_hash,scopes,revoked,created_at FROM api_keys WHERE key_hash=?1",
             params![hash.as_ref()],
@@ -2180,7 +2716,10 @@ impl Db {
     }
 
     pub fn get_api_key_by_id(&self, id: i64) -> Option<ApiKeyRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT id, account_id, name, key_prefix, scopes, revoked, created_at FROM api_keys WHERE id=?1",
             params![id],
@@ -2189,7 +2728,10 @@ impl Db {
     }
 
     pub fn list_api_keys(&self, account_id: i64) -> Vec<ApiKeyListRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = match conn.prepare("SELECT id,account_id,name,key_prefix,revoked,created_at FROM api_keys WHERE account_id=?1 ORDER BY id DESC") { Ok(s)=>s, Err(_)=>return vec![] };
         let rows = stmt
             .query_map(params![account_id], |r| {
@@ -2210,7 +2752,10 @@ impl Db {
     }
 
     pub fn list_api_keys_detail(&self, account_id: i64) -> Vec<ApiKeyRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = match conn.prepare("SELECT id,account_id,name,key_prefix,scopes,revoked,created_at FROM api_keys WHERE account_id=?1 ORDER BY id DESC") { Ok(s)=>s, Err(_)=>return vec![] };
         let rows = stmt
             .query_map(params![account_id], |r| {
@@ -2233,7 +2778,10 @@ impl Db {
 
     pub fn revoke_api_key(&self, id: impl ToString) {
         let s = id.to_string();
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Ok(nid) = s.parse::<i64>() {
             let _ = conn.execute("UPDATE api_keys SET revoked=1 WHERE id=?1", params![nid]);
             return;
@@ -2258,17 +2806,26 @@ impl Db {
 
     // ---- Stats ----
     pub fn count_sellers(&self) -> i64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row("SELECT COUNT(*) FROM sellers", [], |r| r.get(0))
             .unwrap_or(0)
     }
     pub fn count_users(&self) -> i64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
             .unwrap_or(0)
     }
     pub fn count_plans(&self, seller_scope: Option<i64>) -> i64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(sid) = seller_scope {
             conn.query_row(
                 "SELECT COUNT(*) FROM plans WHERE seller_id=?1",
@@ -2282,7 +2839,10 @@ impl Db {
         }
     }
     pub fn count_subscriptions(&self, seller_scope: Option<i64>, status_opt: Option<&str>) -> i64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut sql = "SELECT COUNT(*) FROM subscriptions".to_string();
         let mut conds = vec![];
         if seller_scope.is_some() {
@@ -2315,7 +2875,10 @@ impl Db {
     /// (status, count) for every status present, server-side GROUP BY so the
     /// MCP subs_report aggregates without pulling user rows.
     pub fn subscription_status_counts(&self, seller_scope: Option<i64>) -> Vec<(String, i64)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) =
             if let Some(sid) = seller_scope {
                 (
@@ -2344,7 +2907,10 @@ impl Db {
     }
 
     pub fn count_invoices(&self, seller_scope: Option<i64>, status_opt: Option<&str>) -> i64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut sql = "SELECT COUNT(*) FROM invoices".to_string();
         let mut conds = vec![];
         if seller_scope.is_some() {
@@ -2374,7 +2940,10 @@ impl Db {
         res.unwrap_or(0)
     }
     pub fn count_codes(&self, seller_scope: Option<i64>) -> i64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(sid) = seller_scope {
             conn.query_row(
                 "SELECT COUNT(*) FROM activation_codes WHERE seller_id=?1",
@@ -2388,7 +2957,10 @@ impl Db {
         }
     }
     pub fn count_posts(&self, seller_scope: Option<i64>) -> i64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(sid) = seller_scope {
             conn.query_row(
                 "SELECT COUNT(*) FROM posts WHERE seller_id=?1",
@@ -2402,7 +2974,10 @@ impl Db {
         }
     }
     pub fn revenue_total(&self, seller_scope: Option<i64>) -> f64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let sql = if seller_scope.is_some() {
             "SELECT COALESCE(SUM(CAST(amount AS REAL)),0) FROM invoices WHERE seller_id=?1 AND status='paid'"
         } else {
@@ -2432,7 +3007,10 @@ impl Db {
     /// Park a sensitive tool call: row starts 'pending' and is executed only
     /// after the owner approves it in the bot. Returns the approval id.
     pub fn mcp_create_approval(&self, tool: &str, args_json: &str, expires_at: &str) -> i64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "INSERT INTO mcp_approvals(tool,args_json,status,created_at,expires_at) VALUES(?1,?2,'pending',?3,?4)",
@@ -2442,7 +3020,10 @@ impl Db {
     }
 
     pub fn mcp_get_approval(&self, id: i64) -> Option<McpApprovalRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT id,tool,args_json,status,created_at,expires_at,decided_at,executed_at FROM mcp_approvals WHERE id=?1",
             params![id],
@@ -2469,7 +3050,10 @@ impl Db {
     /// repeated decides lose the rowcount race and return false, so a
     /// double-approve can never execute twice.
     pub fn mcp_decide_approval(&self, id: i64, status: &str) -> bool {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let n = conn
             .execute(
@@ -2481,7 +3065,10 @@ impl Db {
     }
 
     pub fn mcp_mark_executed(&self, id: i64) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "UPDATE mcp_approvals SET executed_at=?1 WHERE id=?2",
@@ -2490,7 +3077,10 @@ impl Db {
     }
 
     pub fn mcp_list_approvals(&self, status: Option<&str>, limit: i64) -> Vec<McpApprovalRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Lazy purge: pendings past their expiry flip to 'expired' on every
         // list, so /approvals never offers a stale row for approval.
         let now = Utc::now().to_rfc3339();
@@ -2546,7 +3136,10 @@ impl Db {
     /// a large payload — and generated codes must never be passed as detail.
     pub fn mcp_audit(&self, tool: &str, role: &str, ok: bool, detail: Option<&str>) {
         let detail = detail.map(|d| d.chars().take(200).collect::<String>());
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
             "INSERT INTO mcp_audit(tool,role,ok,detail,created_at) VALUES(?1,?2,?3,?4,?5)",
@@ -2555,7 +3148,10 @@ impl Db {
     }
 
     pub fn mcp_list_audit(&self, limit: i64) -> Vec<McpAuditRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = match conn.prepare(
             "SELECT id,tool,role,ok,detail,created_at FROM mcp_audit ORDER BY id DESC LIMIT ?1",
         ) {
@@ -2578,6 +3174,79 @@ impl Db {
             Some(iter) => iter.filter_map(|r| r.ok()).collect(),
             None => vec![],
         }
+    }
+
+    // ---- Append-only additions for the L8 API/observability task
+    // (2026-10-25). Kept as a clearly-marked block at the end of the impl so
+    // parallel edits elsewhere in db.rs cannot collide; no existing lines
+    // were modified. Lock handling follows the poisoned-mutex recovery
+    // pattern used by the mcp_* methods above.
+
+    /// Cheap liveness probe for `/health`: `SELECT 1`. Returns false on any
+    /// error so the health endpoint can report `db: "error"` honestly
+    /// instead of panicking. (L8 addition)
+    pub fn ping(&self) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))
+            .map(|v| v == 1)
+            .unwrap_or(false)
+    }
+
+    /// Invalidate every web session of `account_id` except the one for
+    /// `keep_token` (hashed here, matching `create_web_session`/
+    /// `get_web_session`). Used by the API password change so a password
+    /// rotation evicts stolen sessions but keeps the caller logged in.
+    /// (L8 addition)
+    pub fn delete_other_web_sessions(&self, account_id: i64, keep_token: &str) {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(keep_token.as_bytes());
+        let bytes = h.finalize();
+        let mut hash = String::with_capacity(64);
+        for b in bytes.iter() {
+            hash.push_str(&format!("{:02x}", b));
+        }
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = conn.execute(
+            "DELETE FROM web_sessions WHERE account_id=?1 AND token_hash != ?2",
+            params![account_id, hash],
+        );
+    }
+
+    /// Delete an activation code, scoped: `seller_id = Some(id)` only deletes
+    /// codes owned by that seller, `None` (admin/owner) deletes any. Returns
+    /// true when a row was deleted. Redemption rows for the deleted code are
+    /// removed too — and only after the scope predicate matched, so a
+    /// cross-seller attempt deletes nothing at all. (L8 addition)
+    pub fn delete_code_seller_scoped(&self, code: &str, seller_id: Option<i64>) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        // Match first (with the scope predicate), then delete the row and its
+        // redemptions by id — a scope mismatch must not touch anything.
+        let matched: Vec<i64> = match conn.prepare(
+            "SELECT id FROM activation_codes WHERE code=?1 AND (?2 IS NULL OR seller_id=?2)",
+        ) {
+            Ok(mut stmt) => {
+                let mapped = stmt.query_map(params![code, seller_id], |r| r.get::<_, i64>(0));
+                match mapped {
+                    Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                    Err(_) => return false,
+                }
+            }
+            Err(_) => return false,
+        };
+        let mut deleted = false;
+        for id in matched {
+            let redemptions =
+                conn.execute("DELETE FROM code_redemptions WHERE code_id=?1", params![id]);
+            let code_row = conn
+                .execute("DELETE FROM activation_codes WHERE id=?1", params![id])
+                .map(|n| n > 0)
+                .unwrap_or(false);
+            if redemptions.is_ok() && code_row {
+                deleted = true;
+            }
+        }
+        deleted
     }
 }
 
@@ -2614,47 +3283,51 @@ mod tests {
         assert_eq!(code2.5, 1);
     }
 
-    #[test]
-    fn test_web_account_create_verify() {
+    #[tokio::test]
+    async fn test_web_account_create_verify() {
         let path = "/tmp/opencode/test_web_account_create_verify.db";
         let _ = fs::remove_file(path);
         let db = Db::new(path).unwrap();
         db.create_web_account("alice", "secret", "admin", None)
+            .await
             .unwrap();
         // correct password
-        let r = db.verify_web_password("alice", "secret");
+        let r = db.verify_web_password("alice", "secret").await;
         assert!(r.is_some());
         let (id, role, seller) = r.unwrap();
         assert!(id > 0);
         assert_eq!(role, "admin");
         assert!(seller.is_none());
         // wrong password
-        assert!(db.verify_web_password("alice", "wrong").is_none());
+        assert!(db.verify_web_password("alice", "wrong").await.is_none());
         // duplicate username errors
-        let dup = db.create_web_account("alice", "x", "user", None);
+        let dup = db.create_web_account("alice", "x", "user", None).await;
         assert!(dup.is_err());
     }
 
-    #[test]
-    fn test_web_account_update_password() {
+    #[tokio::test]
+    async fn test_web_account_update_password() {
         let path = "/tmp/opencode/test_web_account_update_password.db";
         let _ = fs::remove_file(path);
         let db = Db::new(path).unwrap();
-        db.create_web_account("bob", "oldpw", "user", None).unwrap();
-        assert!(db.verify_web_password("bob", "oldpw").is_some());
-        db.update_web_password("bob", "newpw").unwrap();
+        db.create_web_account("bob", "oldpw", "user", None)
+            .await
+            .unwrap();
+        assert!(db.verify_web_password("bob", "oldpw").await.is_some());
+        db.update_web_password("bob", "newpw").await.unwrap();
         // old fails
-        assert!(db.verify_web_password("bob", "oldpw").is_none());
+        assert!(db.verify_web_password("bob", "oldpw").await.is_none());
         // new succeeds
-        assert!(db.verify_web_password("bob", "newpw").is_some());
+        assert!(db.verify_web_password("bob", "newpw").await.is_some());
     }
 
-    #[test]
-    fn test_web_session_lifecycle() {
+    #[tokio::test]
+    async fn test_web_session_lifecycle() {
         let path = "/tmp/opencode/test_web_session_lifecycle.db";
         let _ = fs::remove_file(path);
         let db = Db::new(path).unwrap();
         db.create_web_account("carol", "pw", "seller", Some(42))
+            .await
             .unwrap();
         let (acc_id, _u, _h, _r, _s) = db.get_web_account_by_username("carol").unwrap();
         // create session (long-lived)
@@ -2675,13 +3348,17 @@ mod tests {
         assert!(db.get_web_session(&token2).is_none());
     }
 
-    #[test]
-    fn test_list_web_accounts() {
+    #[tokio::test]
+    async fn test_list_web_accounts() {
         let path = "/tmp/opencode/test_list_web_accounts.db";
         let _ = fs::remove_file(path);
         let db = Db::new(path).unwrap();
-        db.create_web_account("u1", "p1", "owner", None).unwrap();
-        db.create_web_account("u2", "p2", "admin", None).unwrap();
+        db.create_web_account("u1", "p1", "owner", None)
+            .await
+            .unwrap();
+        db.create_web_account("u2", "p2", "admin", None)
+            .await
+            .unwrap();
         let list = db.list_web_accounts();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0], ("u1".to_string(), "owner".to_string()));
@@ -2879,11 +3556,17 @@ mod tests {
         // scoped listing is the seller's management view: retired rows stay
         assert_eq!(db.list_products(Some(1)).len(), 1);
         assert_eq!(db.list_products(Some(1))[0].8, 0);
-        // cross-seller find helpers (active only)
-        assert_eq!(db.find_products_by_name("ebook").len(), 1);
-        assert_eq!(db.find_products_by_name("ebook")[0].1, 2);
-        assert_eq!(db.find_plans_by_name("gold").len(), 1);
-        assert_eq!(db.find_plans_by_name("gold")[0].6, 1);
+        // scoped /buy name resolution (active only): the live 'ebook' belongs
+        // to seller 2 (seller 1's copy is retired), the plan 'gold' to
+        // seller 1 — each namespace resolves only its own rows.
+        assert_eq!(db.find_products_by_name(Some(2), "ebook").len(), 1);
+        assert_eq!(db.find_products_by_name(Some(2), "ebook")[0].1, 2);
+        assert_eq!(db.find_products_by_name(Some(1), "ebook").len(), 0);
+        assert_eq!(db.find_plans_by_name(Some(1), "gold").len(), 1);
+        assert_eq!(db.find_plans_by_name(Some(1), "gold")[0].6, 1);
+        // unscoped is the cross-seller shop view (the caller filters
+        // namespaces: seller_id 0 is admin/owner-only, see commands.rs)
+        assert_eq!(db.find_products_by_name(None, "ebook").len(), 1);
         // a retired product's name slot can be reused (upsert revives it)
         let id2 = db
             .add_product(1, "ebook", "7", "TON", "physical", None, Some(3))
@@ -3246,18 +3929,23 @@ mod tests {
         assert_eq!(subs.len(), 2);
     }
 
-    #[test]
-    fn test_one_time_credential_rotation() {
+    #[tokio::test]
+    async fn test_one_time_credential_rotation() {
         let path = "/tmp/opencode/test_one_time_credential_rotation.db";
         let _ = fs::remove_file(path);
         let db = Db::new(path).unwrap();
-        db.create_web_account("rot", "pw", "admin", None).unwrap();
+        db.create_web_account("rot", "pw", "admin", None)
+            .await
+            .unwrap();
         let (acc_id, _u, _h, _r, _s) = db.get_web_account_by_username("rot").unwrap();
         let token = db.create_web_session(acc_id, "admin", None, 7);
         assert!(db.get_web_session(&token).is_some());
         // Simulate a pre-CSPRNG database: clear the rotation marker.
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db
+                .conn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             conn.execute(
                 "DELETE FROM config WHERE key='migration_rotate_tokens_v1'",
                 [],
@@ -3388,6 +4076,248 @@ mod tests {
         db.mark_scheduled_posted(id, 999).unwrap();
         let due2 = db.list_due_scheduled();
         assert!(due2.is_empty());
+    }
+
+    #[test]
+    fn test_scheduled_post_attempts_cap_terminal() {
+        // Bounded retries (2026-10-25 review): every send failure bumps the
+        // counter; at the cap the post leaves the due queue with status
+        // 'failed' instead of retrying forever. A concurrent 'posted' win is
+        // never overwritten by the terminal mark.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sched_cap.db");
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let id = db.create_scheduled_post(1, "chat", "content", "text", &past);
+        for expected in 1..=10 {
+            assert_eq!(db.bump_scheduled_attempts(id), expected);
+        }
+        // Not terminal yet: still due.
+        assert_eq!(db.list_due_scheduled().len(), 1);
+        db.mark_scheduled_failed(id);
+        assert!(db.list_due_scheduled().is_empty());
+        let all = db.list_scheduled_posts(Some(1));
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].6, "failed");
+        // The terminal mark is scoped to 'pending': a posted row stays.
+        let id2 = db.create_scheduled_post(1, "chat", "content", "text", &past);
+        db.mark_scheduled_posted(id2, 42).unwrap();
+        db.mark_scheduled_failed(id2);
+        let all2 = db.list_scheduled_posts(Some(1));
+        assert_eq!(
+            all2.iter()
+                .filter(|r| r.0 == id2)
+                .next()
+                .map(|r| r.6.as_str()),
+            Some("posted")
+        );
+    }
+
+    #[test]
+    fn test_invoice_attempts_bump_and_terminal_state() {
+        // The verification-attempts counter advances only via
+        // bump_invoice_attempts (the "not settled yet" release path never
+        // touches it), and the terminal 'failed' status drops the invoice
+        // from pending_invoices() — the verifier's queue.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inv_cap.db");
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        db.save_invoice(
+            "inv1",
+            1,
+            "5",
+            "USDT",
+            None,
+            "active",
+            None,
+            Some("gold"),
+            Some(7),
+            None,
+        );
+        assert_eq!(db.pending_invoices().len(), 1);
+        for expected in 1..=10 {
+            assert_eq!(db.bump_invoice_attempts("inv1"), expected);
+        }
+        // Counter column is stored, not just returned.
+        let raw: i64 = {
+            let conn = Connection::open(&path).unwrap();
+            conn.query_row(
+                "SELECT attempts FROM invoices WHERE invoice_id='inv1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(raw, 10);
+        // Terminal-failed leaves the queue (verifier + release paths use the
+        // same status vocabulary the rest of the codebase writes).
+        db.update_invoice_status("inv1", "failed");
+        assert!(db.pending_invoices().is_empty());
+        // And an unrelated invoice keeps its own counter at zero.
+        db.save_invoice(
+            "inv2",
+            1,
+            "5",
+            "USDT",
+            None,
+            "active",
+            None,
+            Some("gold"),
+            Some(7),
+            None,
+        );
+        assert_eq!(db.bump_invoice_attempts("inv2"), 1);
+    }
+
+    #[test]
+    fn test_wal_checkpoint_best_effort() {
+        // checkpoint() must never panic — including when WAL is unavailable
+        // (in-memory dbs) or the file was never written — and must leave the
+        // database usable afterwards.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.db");
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        db.set_config("k", "v");
+        db.checkpoint();
+        assert_eq!(db.get_config("k").as_deref(), Some("v"));
+        db.checkpoint();
+        // On a WAL-mode file the TRUNCATE checkpoint empties the -wal log.
+        let wal = dir.path().join("wal.db-wal");
+        if wal.exists() {
+            assert_eq!(wal.metadata().unwrap().len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_plan_namespace_cross_seller_isolation() {
+        // (seller_id, name) namespace: two sellers may both define "pro" and
+        // each resolves only their own row; a name unique to another seller
+        // is invisible from the wrong namespace. seller_id 0 is the
+        // admin/owner global namespace.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ns.db");
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        db.add_plan(1, "pro", "10", "USDT", 30, None);
+        db.add_plan(2, "pro", "20", "USDT", 30, None);
+        let p1 = db.find_plans_by_name(Some(1), "pro");
+        let p2 = db.find_plans_by_name(Some(2), "pro");
+        assert_eq!(p1.len(), 1);
+        assert_eq!(p1[0].1, "10");
+        assert_eq!(p1[0].6, 1);
+        assert_eq!(p2.len(), 1);
+        assert_eq!(p2[0].1, "20");
+        assert_eq!(p2[0].6, 2);
+        // a name unique to seller 2 is not resolvable from seller 1
+        db.add_plan(2, "solo", "5", "TON", 7, None);
+        assert!(db.find_plans_by_name(Some(1), "solo").is_empty());
+        // the global namespace (0) is its own namespace, not a wildcard
+        db.add_plan(0, "legacy", "3", "USDT", 30, None);
+        assert_eq!(db.find_plans_by_name(Some(0), "legacy").len(), 1);
+        assert!(db.find_plans_by_name(Some(1), "legacy").is_empty());
+        // cross-seller active view returns all namespaces (caller filters)
+        assert_eq!(db.find_plans_by_name(None, "pro").len(), 2);
+        // the (seller_id, name) uniqueness holds per seller: re-adding the
+        // same name to one seller upserts (INSERT OR REPLACE), it does not
+        // create a second row or collide with the other seller's plan.
+        db.add_plan(1, "pro", "11", "USDT", 30, None);
+        assert_eq!(db.find_plans_by_name(Some(1), "pro").len(), 1);
+        assert_eq!(db.find_plans_by_name(Some(1), "pro")[0].1, "11");
+    }
+
+    #[test]
+    fn test_plan_namespace_dedupe_migration() {
+        // Legacy database: plans WITHOUT the seller_id column and WITHOUT the
+        // UNIQUE(seller_id, name) constraint (both arrive via migration), so
+        // duplicate same-name rows can exist. Db::new must dedupe them
+        // (keeping the LOWEST id), re-point subscriptions/activation codes,
+        // and create the unique index — while a fresh database must NOT get
+        // a redundant manual index next to the schema-level constraint.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE plans (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, price TEXT NOT NULL, asset TEXT NOT NULL, duration_days INTEGER NOT NULL, channel_id TEXT, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+                 CREATE TABLE subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, plan_id INTEGER, channel_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', starts_at TEXT NOT NULL, expires_at TEXT NOT NULL, invoice_id TEXT, code_id INTEGER, created_at TEXT NOT NULL);
+                 CREATE TABLE activation_codes (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL UNIQUE, plan_id INTEGER, value_days INTEGER, max_uses INTEGER NOT NULL DEFAULT 1, uses INTEGER NOT NULL DEFAULT 0, expires_at TEXT, created_at TEXT NOT NULL);
+                 INSERT INTO plans(name,price,asset,duration_days,created_at) VALUES('gold','10','USDT',30,'2024-01-01');
+                 INSERT INTO plans(name,price,asset,duration_days,created_at) VALUES('gold','20','USDT',30,'2024-01-02');
+                 INSERT INTO plans(name,price,asset,duration_days,created_at) VALUES('gold','30','USDT',30,'2024-01-03');
+                 INSERT INTO subscriptions(user_id,plan_id,channel_id,starts_at,expires_at,created_at) VALUES(7,3,'@c','2024-01-01','2024-02-01','2024-01-01');
+                 INSERT INTO activation_codes(code,plan_id,created_at) VALUES('CODE1',2,'2024-01-01');",
+            )
+            .unwrap();
+        }
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        // All three legacy rows carried seller_id 0; the lowest id (price
+        // '10') survived.
+        let kept = db.get_plan(0, "gold").expect("kept lowest-id row");
+        assert_eq!(kept.0, 1);
+        assert_eq!(kept.1, "10");
+        assert_eq!(db.list_plans(Some(0)).len(), 1);
+        // References were re-pointed to the kept row, not orphaned.
+        {
+            let conn = Connection::open(&path).unwrap();
+            let sub_plan: i64 = conn
+                .query_row(
+                    "SELECT plan_id FROM subscriptions WHERE user_id=7",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(sub_plan, 1);
+            let code_plan: i64 = conn
+                .query_row(
+                    "SELECT plan_id FROM activation_codes WHERE code='CODE1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(code_plan, 1);
+            // The legacy table got the unique index (it has no table-level
+            // constraint for sqlite to rely on).
+            let idx: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_index_list('plans') WHERE name='idx_plans_seller_name'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(idx, 1);
+            // The index actually enforces the namespace now.
+            let dup = conn.execute(
+                "INSERT INTO plans(seller_id,name,price,asset,duration_days,active,created_at) VALUES(0,'gold','99','USDT',30,1,'2024-01-04')",
+                [],
+            );
+            assert!(dup.is_err(), "unique index must reject a duplicate");
+        }
+        // A FRESH database relies on the schema-level UNIQUE(seller_id, name)
+        // constraint and must not carry the redundant manual index.
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let fresh = Db::new(fresh_dir.path().join("fresh.db").to_str().unwrap()).unwrap();
+        drop(fresh);
+        {
+            let conn = Connection::open(fresh_dir.path().join("fresh.db")).unwrap();
+            let idx: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_index_list('plans') WHERE name='idx_plans_seller_name'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                idx, 0,
+                "fresh db uses the schema constraint, not a dup index"
+            );
+            let constraint: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_index_list('plans') WHERE \"unique\"=1 AND origin='u'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(constraint, 1);
+        }
     }
 
     proptest! {

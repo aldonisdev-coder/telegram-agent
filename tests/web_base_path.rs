@@ -16,11 +16,12 @@ use tower::ServiceExt;
 
 const BASE: &str = "/agent";
 
-fn make_state(base: &str) -> (WebState, tempfile::TempDir) {
+async fn make_state(base: &str) -> (WebState, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
     let db = Db::new(db_path.to_str().unwrap()).unwrap();
     db.create_web_account("owner", "secret", "owner", None)
+        .await
         .unwrap();
     db.set_config("setup_done", "1");
     let cfg = Config {
@@ -89,7 +90,7 @@ fn assert_prefixed(loc: &str) {
 
 #[tokio::test]
 async fn login_page_urls_carry_base() {
-    let (state, _dir) = make_state(BASE);
+    let (state, _dir) = make_state(BASE).await;
     let app = app_at(BASE, state);
     let resp = app
         .oneshot(
@@ -114,7 +115,7 @@ async fn login_page_urls_carry_base() {
 
 #[tokio::test]
 async fn index_without_session_redirects_to_base_login() {
-    let (state, _dir) = make_state(BASE);
+    let (state, _dir) = make_state(BASE).await;
     let app = app_at(BASE, state);
     // Trailing-slash base root normalizes to the base, which then lands on
     // the login redirect: /agent/ -> /agent -> /agent/login.
@@ -145,7 +146,7 @@ async fn index_without_session_redirects_to_base_login() {
 
 #[tokio::test]
 async fn login_sets_scoped_cookie_and_dashboard_works() {
-    let (state, _dir) = make_state(BASE);
+    let (state, _dir) = make_state(BASE).await;
     let app = app_at(BASE, state);
 
     let resp = app
@@ -202,7 +203,7 @@ async fn login_sets_scoped_cookie_and_dashboard_works() {
 
 #[tokio::test]
 async fn invalid_plan_redirects_to_base_plans() {
-    let (state, _dir) = make_state(BASE);
+    let (state, _dir) = make_state(BASE).await;
     let app = app_at(BASE, state);
     let resp = app
         .clone()
@@ -240,7 +241,7 @@ async fn invalid_plan_redirects_to_base_plans() {
 
 #[tokio::test]
 async fn logout_clears_scoped_cookie() {
-    let (state, _dir) = make_state(BASE);
+    let (state, _dir) = make_state(BASE).await;
     let app = app_at(BASE, state);
     let resp = app
         .clone()
@@ -280,7 +281,7 @@ async fn logout_clears_scoped_cookie() {
 
 #[tokio::test]
 async fn every_redirect_stays_under_base() {
-    let (state, _dir) = make_state(BASE);
+    let (state, _dir) = make_state(BASE).await;
     let app = app_at(BASE, state);
 
     // Logged-out walk over every redirecting GET route. "/" (the base root
@@ -336,7 +337,7 @@ async fn every_redirect_stays_under_base() {
 
 #[tokio::test]
 async fn health_under_base() {
-    let (state, _dir) = make_state(BASE);
+    let (state, _dir) = make_state(BASE).await;
     let app = app_at(BASE, state);
     let resp = app
         .oneshot(
@@ -354,7 +355,7 @@ async fn health_under_base() {
 
 #[tokio::test]
 async fn api_login_under_base() {
-    let (state, _dir) = make_state(BASE);
+    let (state, _dir) = make_state(BASE).await;
     let app = app_at(BASE, state);
     let resp = app
         .oneshot(
@@ -374,7 +375,7 @@ async fn api_login_under_base() {
 
 #[tokio::test]
 async fn default_mount_at_root() {
-    let (state, _dir) = make_state("");
+    let (state, _dir) = make_state("").await;
     let app = app_at("", state);
 
     let resp = app

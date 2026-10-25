@@ -111,7 +111,10 @@ Every tool call and every approve/deny is written to the `mcp_audit` table.
 Activation codes provide an alternative: `/gencodes Premium | 5` then share codes; users run `/redeem CODE`.
 
 ## Architecture
-- `src/main.rs` — dispatcher, dialogue storage.
+- `src/main.rs` — dispatcher, dialogue storage; merges the routers with the request-timeout and metrics layers.
+- `src/web.rs` — server-rendered web dashboard (axum pages, sessions, static assets).
+- `src/api.rs` — REST API under `/api/v1/...` (JSON), plus `/health` and `/metrics`.
+- `src/mcp/` — MCP JSON-RPC 2.0 endpoint at `/api/v1/mcp` (tiered tools, audited).
 - `src/db.rs` — SQLite persistence (plans, subscriptions, codes, invoices, config).
 - `src/crypto.rs` — Crypto Pay API client.
 - `src/handlers/commands.rs` — command handler + access grant.

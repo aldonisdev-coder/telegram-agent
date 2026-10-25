@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS invoices (
     pay_url      TEXT,
     plan_id      TEXT,
     user_id      INTEGER,
+    attempts     INTEGER NOT NULL DEFAULT 0,
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL
 );
@@ -258,7 +259,8 @@ CREATE TABLE IF NOT EXISTS scheduled_posts (
     scheduled_at     TEXT NOT NULL,
     status           TEXT NOT NULL DEFAULT 'pending',
     created_at       TEXT NOT NULL,
-    posted_message_id INTEGER
+    posted_message_id INTEGER,
+    attempts         INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_scheduled_posts_status_time ON scheduled_posts(status, scheduled_at);
 

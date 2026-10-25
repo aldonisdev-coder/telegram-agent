@@ -34,7 +34,7 @@ use crate::ai::rate_limit::RateLimiter;
 use crate::handlers::registry::{CommandContext, CommandRegistry, CommandSpec};
 use crate::roles;
 use crate::web::WebState;
-use tools::Principal;
+use tools::{Principal, Tier};
 
 // JSON-RPC 2.0 error codes (reserved range).
 const CODE_PARSE: i64 = -32700;
@@ -127,6 +127,16 @@ fn authenticate(web: &WebState, headers: &HeaderMap) -> Result<Principal, Box<Re
 /// `seller_id` here instead.
 fn principal_key(principal: &Principal) -> i64 {
     principal.role as i64
+}
+
+/// Fixed label for `mcp_tool_calls_total{tier}` — tier names are static
+/// literals, never derived from request data (see src/metrics.rs invariant).
+fn tier_label(t: Tier) -> &'static str {
+    match t {
+        Tier::Read => "read",
+        Tier::Write => "write",
+        Tier::Sensitive => "sensitive",
+    }
 }
 
 async fn mcp_post(
@@ -251,12 +261,15 @@ async fn dispatch(st: &McpState, principal: &Principal, req: Value) -> Response 
             }
             let Some(spec) = tools::find_tool(name) else {
                 // Unknown tool is invalid params (-32602), per the design.
+                // Metrics: the caller-supplied name is NEVER used as a label;
+                // it lands in the fixed "unknown" bucket.
                 st.web.db.mcp_audit(
                     name,
                     tools::role_name(principal.role),
                     false,
                     Some("unknown tool"),
                 );
+                crate::metrics::mcp_tool(None, "unknown", false);
                 return rpc_error(StatusCode::OK, id, CODE_PARAMS, "unknown tool");
             };
             // Validate BEFORE anything runs: bad args are -32602 with zero
@@ -268,6 +281,7 @@ async fn dispatch(st: &McpState, principal: &Principal, req: Value) -> Response 
                     false,
                     Some(&format!("invalid args: {msg}")),
                 );
+                crate::metrics::mcp_tool(Some(spec.name), tier_label(spec.tier), false);
                 return rpc_error(StatusCode::OK, id, CODE_PARAMS, &msg);
             }
             let outcome = (spec.handler)(st.web.clone(), principal.clone(), args).await;
@@ -300,6 +314,9 @@ async fn dispatch(st: &McpState, principal: &Principal, req: Value) -> Response 
                     );
                 }
             }
+            // Metrics hook: every tools/call outcome (parked approvals count
+            // as ok=true — the call itself succeeded and returned a result).
+            crate::metrics::mcp_tool(Some(spec.name), tier_label(spec.tier), outcome.is_ok());
             tool_result_response(id, outcome)
         }
         "" => rpc_error(StatusCode::OK, id, CODE_METHOD, "missing method"),
