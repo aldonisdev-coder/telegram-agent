@@ -13,8 +13,12 @@
 .env.*
 !.env.example
 
-# Local agent tooling — internal workflow, not published
-/.opencode
+# Local agent tooling — internal workflow, not published. EXCEPTION: the
+# agent charters under agents/ ARE published — verify-agent-tiers.py (part
+# of `make test`) machine-checks the ladder against them, so they travel
+# with the repo.
+/.opencode/*
+!/.opencode/agents
 /.commandcode
 /.mimosa
 
