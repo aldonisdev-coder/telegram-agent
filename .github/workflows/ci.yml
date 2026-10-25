@@ -1,0 +1,91 @@
+# CI — the project gate, on every push and pull request.
+#
+# WHY THIS EXISTS: the quality gate has always lived in `make test` (fmt,
+# clippy -D warnings, the test suite, cargo audit, cargo deny, the role-level
+# routing contract). Before this repository was public that gate ran only on
+# the author's machine; nothing stopped an unvetted pull request from landing.
+# CI runs THE SAME Makefile target — not a copy of it — so the two can never
+# drift: if the gate changes, CI follows the Makefile automatically.
+#
+# The two cross-platform jobs exist for one sentence in DESKTOP.md: "the same
+# code runs on Windows, macOS, and Linux". A compile check on each OS keeps
+# that sentence true on every commit instead of discovering a Windows-only
+# break the day a release is tagged. They check, they do not test: the full
+# suite belongs to the ubuntu gate, and the platform jobs exist to catch
+# platform-specific compile breakage cheaply.
+#
+# Note for maintainers: cargo audit / cargo deny fetch the RUSTSEC advisory
+# database over the network — that is expected, not a sandboxing gap.
+
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  gate:
+    name: Gate (fmt, clippy, test, audit, deny, routing contract)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit & cargo-deny
+        # Tool passed as an input, never parsed from the @ref — the ref form
+        # can silently install nothing (observed on shadowmesh, 2026-10-23).
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: Run the project gate
+        run: make test
+
+  linux-x64:
+    name: Compile check (linux-x64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
+  windows-x64:
+    name: Compile check (windows-x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
+  macos:
+    name: Compile check (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
