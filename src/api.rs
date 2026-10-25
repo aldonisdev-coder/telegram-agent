@@ -1104,10 +1104,12 @@ async fn posts_create(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
+    // Default channel: managed channels table (is_default global row) with
+    // legacy-config fallback — see Db::default_channel.
     let ch = f
         .channel
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| state.db.get_config("channel").unwrap_or_default());
+        .unwrap_or_else(|| state.db.default_channel().unwrap_or_default());
     if ch.is_empty() || f.text.trim().is_empty() {
         return err(
             StatusCode::BAD_REQUEST,

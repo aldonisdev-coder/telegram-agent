@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use teloxide::{
     dispatching::dialogue::{ErasedStorage, SqliteStorage, Storage, serializer::Json},
@@ -104,6 +105,21 @@ async fn main() {
         && let Some(ch) = &cfg.default_channel
     {
         db.set_config("channel", ch);
+    }
+
+    // v1.3.x claim flow: setup is skippable, so an instance may run with no
+    // owner web account. Until one exists (and setup is complete), maintain
+    // the one-time claim code and print it once, loudly — the same
+    // CSPRNG-secret-printed-once pattern as the generated WEB_PASSWORD above
+    // (stderr at startup; the operator copies it from the console). Whenever
+    // an owner account exists the code is stale and cleared: claim mode can
+    // never return. Web claim handlers (web.rs) compare what the browser
+    // presents against `db.claim_code()` and waive the code for loopback
+    // peers — see the ConnectInfo note on the serve call below.
+    if let Some(code) = db.ensure_claim_code() {
+        eprintln!(
+            "First-run claim code: {code}\n  One-time code for claiming the owner account in the web console (required only from a non-loopback browser; localhost needs no code)."
+        );
     }
 
     let crypto = cfg
@@ -637,7 +653,17 @@ async fn main() {
         tracing::info!("bot polling disabled until configured (setup mode)");
         None
     };
-    let web_task = tokio::spawn(async move { axum::serve(listener, web_router).await.unwrap() });
+    // ConnectInfo: the web claim handlers (v1.3.x) read the peer address via
+    // ConnectInfo<SocketAddr> so codeless claiming works only from loopback —
+    // without the make-service wrapper axum cannot see peer addresses.
+    let web_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            web_router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => { tracing::info!("shutdown signal received"); }

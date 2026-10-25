@@ -291,6 +291,7 @@ async fn every_redirect_stays_under_base() {
     for path in [
         "/",
         "/dashboard",
+        "/settings",
         "/channels",
         "/plans",
         "/posts",
@@ -335,6 +336,40 @@ async fn every_redirect_stays_under_base() {
         .unwrap();
     assert!(resp.status().is_redirection());
     assert_prefixed(&location(&resp));
+}
+
+#[tokio::test]
+async fn settings_page_urls_carry_base() {
+    let (state, _dir) = make_state(BASE).await;
+    let db = state.db.clone();
+    let (acc_id, _u, _h, _r, _s) = db.get_web_account_by_username("owner").unwrap();
+    let token = db.create_web_session(acc_id, "owner", None, 7);
+    let app = app_at(BASE, state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("{BASE}/settings"))
+                .header("cookie", format!("session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(
+        body.contains(&format!("action=\"{BASE}/settings/save\"")),
+        "settings save form action missing base prefix:\n{body}"
+    );
+    assert!(
+        body.contains(&format!("action=\"{BASE}/settings/password\"")),
+        "password form action missing base prefix:\n{body}"
+    );
+    assert!(
+        body.contains(&format!("href=\"{BASE}/settings\"")),
+        "rail foot Settings link missing base prefix:\n{body}"
+    );
 }
 
 #[tokio::test]

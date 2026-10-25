@@ -27,6 +27,17 @@ type InvoiceRow = (
 // them (the /buy resolver in handlers::commands returns these verbatim).
 pub type PlanRow = (String, String, String, i64, Option<String>, bool, i64);
 pub type PlanGlobalRow = (i64, i64, String, String, String, i64, Option<String>);
+// Named-field row (not a tuple alias) — a new public surface consumed by the
+// web channels manager; seller_id 0 = global namespace, is_default flags the
+// single global default.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelRow {
+    pub id: i64,
+    pub channel: String,
+    pub seller_id: i64,
+    pub is_default: bool,
+    pub created_at: String,
+}
 pub type ProductRow = (
     i64,
     i64,
@@ -284,6 +295,58 @@ impl Db {
             "CREATE INDEX IF NOT EXISTS idx_mcp_audit_created ON mcp_audit(created_at)",
             [],
         );
+        // v1.3.x channels: managed-channel store (schema.sql declares it for
+        // fresh databases; this covers legacy ones). One-time seed: an
+        // existing install's default channel lives in the legacy free-text
+        // `channel` config key, and on the first run after this migration it
+        // becomes the table's single default global row. Tracked with a
+        // config marker so it runs exactly once per database — removing all
+        // channels later must not resurrect the legacy value on restart. The
+        // legacy key itself is kept (never deleted): `default_channel` falls
+        // back to it honestly.
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL UNIQUE COLLATE NOCASE, seller_id INTEGER NOT NULL DEFAULT 0, is_default INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_channels_seller ON channels(seller_id)",
+            [],
+        );
+        let channels_seeded = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = 'migration_channels_seed_v1'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if channels_seeded.is_none() {
+            let legacy: Option<String> = conn
+                .query_row("SELECT value FROM config WHERE key = 'channel'", [], |r| {
+                    r.get(0)
+                })
+                .optional()
+                .ok()
+                .flatten();
+            let channel_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM channels", [], |r| r.get(0))
+                .unwrap_or(1); // probe failure: do not seed on top of an unknown state
+            if channel_count == 0
+                && let Some(ch) = legacy.filter(|s| !s.trim().is_empty())
+            {
+                let ins = conn.execute(
+                    "INSERT OR IGNORE INTO channels(channel,seller_id,is_default,created_at) VALUES(?1,0,1,?2)",
+                    params![ch.trim(), Utc::now().to_rfc3339()],
+                );
+                if ins.is_ok() {
+                    tracing::info!(
+                        "channels: seeded default channel '{ch}' from the legacy config key"
+                    );
+                }
+            }
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO config(key,value,updated_at) VALUES('migration_channels_seed_v1','1',?1)",
+                params![Utc::now().to_rfc3339()],
+            );
+        }
         // invoices.product_id: nullable item reference selecting the grant
         // branch (NULL = existing plan path). Idempotent column add.
         let invoices_has_product_id = conn
@@ -3248,6 +3311,221 @@ impl Db {
         }
         deleted
     }
+
+    // ---- Channels store (v1.3.x: "channels become managed data") ----
+    //
+    // `seller_id` 0 is the global namespace — the convention the plan
+    // namespace work established. Channel names are unique console-wide
+    // (UNIQUE COLLATE NOCASE in schema.sql): a Telegram @username names one
+    // channel no matter who references it, so dedupe errors are honest, not
+    // incidental. The legacy free-text `channel` config key is NOT removed;
+    // it survives only as `default_channel`'s fallback for legacy installs.
+
+    fn map_channel_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChannelRow> {
+        Ok(ChannelRow {
+            id: r.get(0)?,
+            channel: r.get(1)?,
+            seller_id: r.get(2)?,
+            is_default: r.get::<_, i64>(3)? != 0,
+            created_at: r.get(4)?,
+        })
+    }
+
+    /// Register `channel` under `seller_id` (0 = global/owner). Fails with an
+    /// honest message on the table-wide UNIQUE (the name already exists, in
+    /// any namespace, any letter case) and on empty names.
+    pub fn add_channel(&self, channel: &str, seller_id: i64) -> Result<(), String> {
+        let ch = channel.trim();
+        if ch.is_empty() {
+            return Err("channel must not be empty".to_string());
+        }
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO channels(channel,seller_id,created_at) VALUES(?1,?2,?3)",
+            params![ch, seller_id, now],
+        )
+        .map(|_| ())
+        .map_err(|e| {
+            if e.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                format!("channel '{ch}' already exists")
+            } else {
+                format!("failed to add channel '{ch}': {e}")
+            }
+        })
+    }
+
+    /// Remove `channel` scoped to `seller_id`: a seller can only remove their
+    /// own row, 0 removes only global rows — a cross-scope attempt (or an
+    /// unknown name) deletes nothing and returns an honest Err, mirroring
+    /// `add_channel`'s Result so the console can surface the refusal.
+    pub fn remove_channel(&self, channel: &str, seller_id: i64) -> Result<(), String> {
+        let ch = channel.trim();
+        if ch.is_empty() {
+            return Err("channel must not be empty".to_string());
+        }
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        // `channel = ?1` compares with the column's NOCASE collation.
+        let deleted = conn
+            .execute(
+                "DELETE FROM channels WHERE channel = ?1 AND seller_id = ?2",
+                params![ch, seller_id],
+            )
+            .map_err(|e| format!("failed to remove channel '{ch}': {e}"))?;
+        if deleted > 0 {
+            Ok(())
+        } else {
+            Err(format!("channel '{ch}' not found (or not yours to remove)"))
+        }
+    }
+
+    /// Make `channel` THE default (global namespace only): every other row
+    /// loses is_default, then the channel is flipped to default when it
+    /// exists as a global row or inserted as a new global row when missing.
+    /// A channel that exists only under a seller's namespace is refused with
+    /// an honest error — the global default must not silently hijack a
+    /// seller-owned row (and no upsert could: the UNIQUE row belongs to the
+    /// seller). The refusal is checked BEFORE any flag is touched, so a
+    /// refused call leaves the current default exactly as it was.
+    pub fn set_default_channel(&self, channel: &str) -> Result<(), String> {
+        let ch = channel.trim();
+        if ch.is_empty() {
+            return Err("channel must not be empty".to_string());
+        }
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let seller_owned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM channels WHERE channel = ?1 AND seller_id != 0",
+                params![ch],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if seller_owned > 0 {
+            return Err(format!(
+                "channel '{ch}' belongs to a seller and cannot become the global default"
+            ));
+        }
+        // Clear every default first, so afterwards exactly one row — the
+        // global one — carries the flag ("switches exactly one row").
+        let _ = conn.execute("UPDATE channels SET is_default = 0", []);
+        let flipped = conn.execute(
+            "UPDATE channels SET is_default = 1 WHERE channel = ?1 AND seller_id = 0",
+            params![ch],
+        );
+        match flipped {
+            Ok(n) if n > 0 => Ok(()),
+            Ok(_) => {
+                let now = Utc::now().to_rfc3339();
+                conn.execute(
+                    "INSERT INTO channels(channel,seller_id,is_default,created_at) VALUES(?1,0,1,?2)",
+                    params![ch, now],
+                )
+                .map(|_| ())
+                .map_err(|e| format!("failed to set default channel '{ch}': {e}"))
+            }
+            Err(e) => Err(format!("failed to set default channel '{ch}': {e}")),
+        }
+    }
+
+    /// Resolve the global default channel: the channels table first (the
+    /// single is_default global row), then the legacy free-text `channel`
+    /// config key so existing installs keep working untouched. `None` =
+    /// nothing configured.
+    pub fn default_channel(&self) -> Option<String> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let from_table: Option<String> = conn
+            .query_row(
+                "SELECT channel FROM channels WHERE is_default = 1 AND seller_id = 0 ORDER BY id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        drop(conn);
+        from_table
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.get_config("channel").filter(|s| !s.trim().is_empty()))
+    }
+
+    /// List channels: `None` = every row (owner view); `Some(seller)` = the
+    /// global namespace plus that seller's own rows, in insertion order.
+    pub fn list_channels(&self, seller_scope: Option<i64>) -> Vec<ChannelRow> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let sql = match seller_scope {
+            Some(_) => {
+                "SELECT id, channel, seller_id, is_default, created_at FROM channels WHERE seller_id = 0 OR seller_id = ?1 ORDER BY id"
+            }
+            None => {
+                "SELECT id, channel, seller_id, is_default, created_at FROM channels ORDER BY id"
+            }
+        };
+        let mut stmt = match conn.prepare(sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = match seller_scope {
+            Some(sid) => stmt.query_map(params![sid], Self::map_channel_row).ok(),
+            None => stmt.query_map([], Self::map_channel_row).ok(),
+        };
+        rows.map(|it| it.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    // ---- Claim flow (v1.3.x: setup becomes skippable) ----
+
+    /// Whether any owner-role web account exists. Claim mode is exactly "no
+    /// owner account"; once one exists it never returns.
+    pub fn owner_account_exists(&self) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM web_accounts WHERE role = 'owner')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|v| v != 0)
+        .unwrap_or(false)
+    }
+
+    /// The stored one-time claim code, if one is live. An emptied value
+    /// (written by `ensure_claim_code` on clear) counts as cleared.
+    pub fn claim_code(&self) -> Option<String> {
+        self.get_config("claim_code")
+            .filter(|c| !c.trim().is_empty())
+    }
+
+    /// Startup maintenance for the claim flow; the caller prints the returned
+    /// code once, loudly, to the console (CSPRNG-secret-printed-once
+    /// pattern). Exactly the v1.3.x contract:
+    /// - owner account exists -> any stored code is stale: cleared (claim
+    ///   mode can never return), return None;
+    /// - no owner and setup NOT completed (`setup_done` unset, the same flag
+    ///   the web gate reads) -> keep the existing code across restarts
+    ///   (stable while unclaimed) or generate a fresh CSPRNG one, return it;
+    /// - no owner but setup completed (the Skip path) -> no code is minted
+    ///   or printed at startup; a code stored before the skip stays stored
+    ///   untouched, so a claim surface may still honor it.
+    pub fn ensure_claim_code(&self) -> Option<String> {
+        if self.owner_account_exists() {
+            if self.claim_code().is_some() {
+                // Cleared, not deleted: the config table has no delete path
+                // and an empty value reads as "no live code" everywhere.
+                self.set_config("claim_code", "");
+            }
+            return None;
+        }
+        if self.get_config("setup_done").is_some() {
+            return None;
+        }
+        match self.claim_code() {
+            Some(c) => Some(c),
+            None => {
+                let code = crate::util::gen_token(12);
+                self.set_config("claim_code", &code);
+                Some(code)
+            }
+        }
+    }
 }
 
 fn generate_code() -> String {
@@ -4318,6 +4596,266 @@ mod tests {
                 .unwrap();
             assert_eq!(constraint, 1);
         }
+    }
+
+    #[test]
+    fn test_channels_add_dedupe_and_scoping() {
+        // The channels store: seller_id 0 is the global namespace; names are
+        // unique console-wide and case-insensitive (a Telegram @username
+        // names one channel no matter who references it).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("channels.db");
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        assert!(db.add_channel("@global", 0).is_ok());
+        assert!(db.add_channel("@seller1", 1).is_ok());
+        // Dedupe: same channel, different case or namespace, is refused with
+        // an honest message — not a raw SQLite constraint dump. (The message
+        // names the caller's spelling, so assert the refusal class, not an
+        // exact string across cases.)
+        let dup = db.add_channel("@GLOBAL", 0).unwrap_err();
+        assert!(dup.contains("already exists"), "got: {dup}");
+        assert!(
+            db.add_channel("@global", 1)
+                .unwrap_err()
+                .contains("already exists"),
+            "dedupe is console-wide across namespaces"
+        );
+        assert_eq!(db.list_channels(None).len(), 2, "duplicates must not land");
+        // Empty names are rejected.
+        assert!(db.add_channel("   ", 0).is_err());
+        // Scoping: the owner view (None) sees everything; a seller sees the
+        // global namespace plus their own rows, never another seller's.
+        assert_eq!(db.list_channels(None).len(), 2);
+        let s1 = db.list_channels(Some(1));
+        assert_eq!(s1.len(), 2);
+        assert!(s1.iter().any(|c| c.channel == "@global"));
+        assert!(s1.iter().any(|c| c.channel == "@seller1"));
+        db.add_channel("@seller2", 2).unwrap();
+        let s2 = db.list_channels(Some(2));
+        assert_eq!(s2.len(), 2);
+        assert!(
+            s2.iter().all(|c| c.channel != "@seller1"),
+            "other sellers invisible"
+        );
+        // Row shape: named fields, global namespace, not a default.
+        let row = db
+            .list_channels(None)
+            .into_iter()
+            .find(|c| c.channel == "@global")
+            .unwrap();
+        assert_eq!(row.seller_id, 0);
+        assert!(!row.is_default);
+        assert!(!row.created_at.is_empty());
+    }
+
+    #[test]
+    fn test_channels_remove_scoping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rm.db");
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        db.add_channel("@global", 0).unwrap();
+        db.add_channel("@own", 1).unwrap();
+        db.add_channel("@other", 2).unwrap();
+        // A seller cannot remove the global row or another seller's row.
+        assert!(db.remove_channel("@global", 1).is_err());
+        assert!(db.remove_channel("@other", 1).is_err());
+        assert!(
+            db.remove_channel("@OTHER", 1).is_err(),
+            "case-insensitive name, still scoped"
+        );
+        assert_eq!(
+            db.list_channels(None).len(),
+            3,
+            "nothing deleted by cross-scope attempts"
+        );
+        // A seller removes their own row.
+        assert!(db.remove_channel("@own", 1).is_ok());
+        assert!(
+            db.remove_channel("@own", 1).is_err(),
+            "second remove is not-found"
+        );
+        // The owner (0) removes global rows only.
+        assert!(db.remove_channel("@global", 0).is_ok());
+        assert!(
+            db.remove_channel("@other", 0).is_err(),
+            "owner does not reach seller rows here"
+        );
+        assert_eq!(
+            db.list_channels(None).len(),
+            1,
+            "only @other (seller 2) survives"
+        );
+        // Empty names are refused, not silently ignored.
+        assert!(db.remove_channel("", 0).is_err());
+    }
+
+    #[test]
+    fn test_channels_default_switches_exactly_one_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("default.db");
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        // Missing channels are upserted as new global defaults.
+        db.set_default_channel("@a").unwrap();
+        assert_eq!(db.default_channel().as_deref(), Some("@a"));
+        db.add_channel("@b", 0).unwrap();
+        // Switching: exactly one row carries the flag afterwards.
+        db.set_default_channel("@b").unwrap();
+        assert_eq!(db.default_channel().as_deref(), Some("@b"));
+        let defaults = db
+            .list_channels(None)
+            .into_iter()
+            .filter(|c| c.is_default)
+            .count();
+        assert_eq!(defaults, 1, "switching must clear every other is_default");
+        // A seller-owned channel cannot become the global default.
+        db.add_channel("@seller", 5).unwrap();
+        let err = db.set_default_channel("@seller").unwrap_err();
+        assert!(err.contains("belongs to a seller"), "got: {err}");
+        assert_eq!(
+            db.default_channel().as_deref(),
+            Some("@b"),
+            "refusal must not clobber"
+        );
+        // Re-flipping back to a global row works, still exactly one default.
+        db.set_default_channel("@a").unwrap();
+        assert_eq!(db.default_channel().as_deref(), Some("@a"));
+        assert_eq!(
+            db.list_channels(None)
+                .into_iter()
+                .filter(|c| c.is_default)
+                .count(),
+            1
+        );
+        // Empty names are rejected.
+        assert!(db.set_default_channel("  ").is_err());
+    }
+
+    #[test]
+    fn test_default_channel_legacy_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-fallback.db");
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        // Nothing anywhere: None.
+        assert!(db.default_channel().is_none());
+        // Legacy installs: the free-text `channel` config key is honored.
+        db.set_config("channel", "@legacy");
+        assert_eq!(db.default_channel().as_deref(), Some("@legacy"));
+        // An empty legacy value is never resolved as a channel.
+        db.set_config("channel", "");
+        assert!(
+            db.default_channel().is_none(),
+            "empty legacy value is not a channel"
+        );
+        db.set_config("channel", "@legacy");
+        // A table default wins over the legacy key.
+        db.set_default_channel("@table").unwrap();
+        assert_eq!(db.default_channel().as_deref(), Some("@table"));
+        // Seller-owned rows never resolve as the global default, flag or not.
+        db.add_channel("@sellerch", 7).unwrap();
+        db.set_default_channel("@sellerch").unwrap_err();
+        assert_eq!(db.default_channel().as_deref(), Some("@table"));
+    }
+
+    #[test]
+    fn test_channels_migration_seeds_from_legacy_config() {
+        // Legacy database: only the config table with the `channel` key. The
+        // one-time migration seeds the channels table with that value as the
+        // single default global row.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE config(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+                 INSERT INTO config(key,value,updated_at) VALUES('channel','@old','2024-01-01');",
+            )
+            .unwrap();
+        }
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        let rows = db.list_channels(None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].channel, "@old");
+        assert_eq!(rows[0].seller_id, 0, "seed lands in the global namespace");
+        assert!(rows[0].is_default, "seeded row is the default");
+        assert_eq!(db.default_channel().as_deref(), Some("@old"));
+        // Reopen (second startup): the config marker prevents a re-seed.
+        drop(db);
+        let db2 = Db::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(db2.list_channels(None).len(), 1);
+        // Removing the channel afterwards must not resurrect it on restart.
+        assert!(db2.remove_channel("@old", 0).is_ok());
+        drop(db2);
+        let db3 = Db::new(path.to_str().unwrap()).unwrap();
+        assert!(db3.list_channels(None).is_empty());
+        // A legacy db with an empty `channel` value seeds nothing.
+        let empty_dir = tempfile::tempdir().unwrap();
+        {
+            let conn = Connection::open(empty_dir.path().join("e.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE config(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+                 INSERT INTO config(key,value,updated_at) VALUES('channel','','2024-01-01');",
+            )
+            .unwrap();
+        }
+        let empty = Db::new(empty_dir.path().join("e.db").to_str().unwrap()).unwrap();
+        assert!(empty.list_channels(None).is_empty());
+        assert!(empty.default_channel().is_none());
+        // A fresh database (no legacy key at all) seeds nothing either.
+        let fresh = Db::new(dir.path().join("fresh.db").to_str().unwrap()).unwrap();
+        assert!(fresh.list_channels(None).is_empty());
+    }
+
+    #[test]
+    fn test_claim_code_stable_while_unclaimed() {
+        // Fresh install (no owner account, setup not completed): a claim code
+        // is generated, stored, and served — and repeated startups (same Db
+        // and a reopened Db) keep the SAME code while it stays unclaimed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claim.db");
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        assert!(!db.owner_account_exists());
+        let first = db.ensure_claim_code().expect("code must be generated");
+        assert_eq!(first.len(), 12, "gen_token(12) shape");
+        assert_eq!(db.claim_code().as_deref(), Some(first.as_str()));
+        assert_eq!(
+            db.ensure_claim_code().as_deref(),
+            Some(first.as_str()),
+            "not regenerated within one run"
+        );
+        drop(db);
+        let db2 = Db::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            db2.ensure_claim_code().as_deref(),
+            Some(first.as_str()),
+            "not regenerated across startups"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_code_cleared_when_owner_exists() {
+        // Once an owner account exists, the stored code is stale: startup
+        // maintenance clears it and claim mode can never return.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claim-owner.db");
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        let code = db.ensure_claim_code().expect("pre-claim code exists");
+        db.create_web_account("owner", "password123", "owner", None)
+            .await
+            .expect("owner account created");
+        assert!(db.owner_account_exists());
+        assert!(
+            db.ensure_claim_code().is_none(),
+            "no code printed once claimed"
+        );
+        assert!(
+            db.claim_code().is_none(),
+            "stale code cleared from the store"
+        );
+        assert_ne!(db.claim_code().as_deref(), Some(code.as_str()));
+        // Repeated startups stay clean (no resurrection, no churn).
+        drop(db);
+        let db2 = Db::new(path.to_str().unwrap()).unwrap();
+        assert!(db2.ensure_claim_code().is_none());
     }
 
     proptest! {

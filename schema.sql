@@ -264,6 +264,20 @@ CREATE TABLE IF NOT EXISTS scheduled_posts (
 );
 CREATE INDEX IF NOT EXISTS idx_scheduled_posts_status_time ON scheduled_posts(status, scheduled_at);
 
+-- Managed channels (v1.3.x: "channels become managed data"). seller_id 0 is
+-- the global namespace (same convention as the plan namespace); owner-managed
+-- global channels and seller-owned ones live in one table. Channel names are
+-- unique console-wide and case-insensitive: a Telegram @username names one
+-- channel no matter who references it. Exactly one row may carry is_default.
+CREATE TABLE IF NOT EXISTS channels (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel    TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    seller_id  INTEGER NOT NULL DEFAULT 0,
+    is_default INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_channels_seller ON channels(seller_id);
+
 -- MCP approvals: sensitive tool calls park here until the owner decides via
 -- the bot; args_json is replayed verbatim on approval.
 CREATE TABLE IF NOT EXISTS mcp_approvals (

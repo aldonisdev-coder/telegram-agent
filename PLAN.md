@@ -78,6 +78,33 @@ gap designs, scale seam contracts), `docs/DEPLOY_PROFILES.md`, `docs/DESKTOP.md`
   - Verification: in-process axum oneshot tests (no network, no real bot) —
     auth, protocol methods, tier annotations, masking, the full
     approval lifecycle, audit rows.
+- **Setup becomes skippable; configuration moves in-console (v1.3.x).**
+  The first-run wall is wrong for a product whose bot can also be
+  configured later. New flow, security floor intact (B2 semantics):
+  1. `/setup` gains **Skip for now** — it sets `setup_done=1` and creates
+     NO owner account. The bot simply stays unconnected (the existing
+     "setup mode" polling behavior).
+  2. With no owner account, `/login` becomes **claim mode**: create the
+     owner account. Anti-takeover (the B2 lesson applies to claims too):
+     claiming requires a one-time **claim code** generated at startup and
+     printed to the server console — unless the request arrives from
+     loopback (desktop default binds 127.0.0.1, where claiming with no
+     code is the whole point). Once claimed, claim mode never returns.
+  3. **Settings** (`/settings`, owner-only, in-console): bot token
+     (write-only — never rendered back), owner ID, default channel,
+     Crypto Pay token, dashboard password. Saves reuse the setup .env
+     writer (extracted, key-preserving, 0600) and say honestly: the bot
+     connects on restart.
+  4. **Channels become managed data**: a `channels` table (channel,
+     seller_id 0 = global, is_default). Owner manages global channels
+     (add / set default / remove) in the console; sellers keep their
+     bot-managed channel, shown read-only. The default-channel readers
+     (`get_config("channel")` call sites) resolve through the table with
+     legacy-config fallback. The dashboard Post form gets a channel
+     dropdown instead of a free-text guess.
+  - Orchestration: L9 core/data (semantics, claim code, channels store,
+    env-writer extraction) + L7 web (skip, claim UI, settings, channels
+    manager); bot command surface unchanged in v1.
 
 ### v2 (trigger-driven)
 - Bookings: services/slots/bookings reusing the invoice pipeline.

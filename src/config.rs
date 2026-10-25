@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
 pub struct Config {
@@ -103,6 +104,99 @@ pub fn load_dotenv() {
         return;
     }
     let _ = dotenvy::from_path(data_dir().join(".env"));
+}
+
+// ---- .env writer (v1.3.x: extracted from the setup form so setup AND the
+// owner settings page share one writer) ----
+
+/// `.env` keys owned by the setup/settings forms: each write rewrites exactly
+/// these. Every other line in an existing `.env` (WEB_BIND, WEB_URL,
+/// WEB_BASE_PATH, OPEN_BROWSER, ...) is preserved verbatim so a re-run never
+/// drops deployment settings it knows nothing about.
+pub const SETUP_ENV_KEYS: [&str; 9] = [
+    "TELEGRAM_BOT_TOKEN",
+    "OWNER_ID",
+    "DATABASE_URL",
+    "DEFAULT_CHANNEL",
+    "CRYPTO_PAY_TOKEN",
+    "WEB_USERNAME",
+    "WEB_PASSWORD",
+    "WEB_PORT",
+    "RUST_LOG",
+];
+
+/// Pure path resolution for the `.env` writer, testable without touching the
+/// process environment. An explicit `ENV_FILE` wins even when that file does
+/// not exist yet (a blank value is ignored and falls through); then an
+/// existing cwd `.env`; then an existing data-dir `.env`; a fresh file is
+/// created in the cwd. Mirrors `load_dotenv`'s lookup, so the file written is
+/// the file read on the next start.
+fn resolve_env_path(explicit: Option<&str>, cwd_env: &Path, data_env: &Path) -> PathBuf {
+    if let Some(p) = explicit.filter(|s| !s.trim().is_empty()) {
+        return PathBuf::from(p);
+    }
+    if cwd_env.exists() || !data_env.exists() {
+        cwd_env.to_path_buf()
+    } else {
+        data_env.to_path_buf()
+    }
+}
+
+/// Write the setup/settings `KEY=value` pairs into the active `.env`,
+/// preserving every line whose key is outside [`SETUP_ENV_KEYS`] verbatim
+/// (comments and blank lines are dropped, matching the original setup
+/// writer). `updates` are written first in the given order, preserved lines
+/// follow. Best-effort `0600` permissions on unix — secrets live here.
+/// Reading an existing file that cannot be read fails closed (Err) rather
+/// than clobbering unknown content. Returns the path written.
+pub fn write_env_file(updates: &[(String, String)]) -> Result<PathBuf, io::Error> {
+    let explicit = env::var("ENV_FILE").ok();
+    let data_env = data_dir().join(".env");
+    let path = resolve_env_path(explicit.as_deref(), Path::new(".env"), &data_env);
+    write_env_file_at(&path, updates)
+}
+
+/// Core of [`write_env_file`] against an explicit path (no environment
+/// reads), so the merge rules and permission handling are testable in
+/// isolation. The caller owns choosing the path via [`resolve_env_path`].
+fn write_env_file_at(path: &Path, updates: &[(String, String)]) -> Result<PathBuf, io::Error> {
+    let mut preserved: Vec<String> = Vec::new();
+    if path.exists() {
+        let existing = fs::read_to_string(path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("cannot read existing {}: {e}", path.display()),
+            )
+        })?;
+        for line in existing.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            // Key = text before the first `=`, top level only.
+            match line.split('=').next() {
+                Some(key) if SETUP_ENV_KEYS.contains(&key) => continue,
+                _ => preserved.push(line.to_string()),
+            }
+        }
+    }
+    let mut content = String::new();
+    for (k, v) in updates {
+        content.push_str(&format!("{k}={v}\n"));
+    }
+    if !preserved.is_empty() {
+        content.push_str(&preserved.join("\n"));
+        content.push('\n');
+    }
+    fs::write(path, content)
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot write {}: {e}", path.display())))?;
+    // best-effort permissions 0600
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(path.to_path_buf())
 }
 
 /// Normalize a `WEB_BASE_PATH` value: trim whitespace, strip trailing `/`s,
@@ -357,5 +451,98 @@ mod tests {
         assert_eq!(normalize_web_base_path("agent"), "");
         assert_eq!(normalize_web_base_path("agent/"), "");
         assert_eq!(normalize_web_base_path("a/b"), "");
+    }
+
+    // ---- .env writer ----
+
+    #[test]
+    fn env_writer_preserves_foreign_keys_and_rewrites_owned_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = dir.path().join(".env");
+        std::fs::write(
+            &env,
+            "# deployment settings\nWEB_BIND=0.0.0.0\nTELEGRAM_BOT_TOKEN=old\n\nWEB_URL=https://example.com\n",
+        )
+        .unwrap();
+        let written = write_env_file_at(
+            &env,
+            &[
+                ("TELEGRAM_BOT_TOKEN".to_string(), "new".to_string()),
+                ("WEB_PASSWORD".to_string(), "hunter2".to_string()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(written, env);
+        let content = std::fs::read_to_string(&env).unwrap();
+        // Owned keys are rewritten, updates first in the given order.
+        assert!(content.starts_with("TELEGRAM_BOT_TOKEN=new\nWEB_PASSWORD=hunter2\n"));
+        assert!(!content.contains("old"), "stale owned value must go");
+        // Foreign keys are preserved verbatim (in the preserved tail).
+        assert!(content.contains("WEB_BIND=0.0.0.0\n"));
+        assert!(content.contains("WEB_URL=https://example.com\n"));
+        // Comments and blank lines are dropped (original setup-writer rules).
+        assert!(!content.contains("deployment settings"));
+        // 0600 on unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&env).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "secrets file must be owner-only");
+        }
+    }
+
+    #[test]
+    fn env_writer_creates_fresh_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = dir.path().join(".env");
+        assert!(!env.exists());
+        let written = write_env_file_at(&env, &[("OWNER_ID".to_string(), "42".to_string())])
+            .expect("fresh file must be created");
+        assert_eq!(written, env);
+        assert_eq!(std::fs::read_to_string(&env).unwrap(), "OWNER_ID=42\n");
+        // An empty updates list still yields a valid (headerless) file.
+        let empty = dir.path().join("empty.env");
+        write_env_file_at(&empty, &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(&empty).unwrap(), "");
+    }
+
+    #[test]
+    fn env_writer_fails_closed_on_unreadable_existing_file() {
+        // A directory where a file is expected: read_to_string always fails
+        // (EISDIR), for every user including root — a deterministic way to
+        // exercise the fail-closed read path.
+        let dir = tempfile::tempdir().unwrap();
+        let env = dir.path().join(".env");
+        std::fs::create_dir(&env).unwrap();
+        let res = write_env_file_at(&env, &[("OWNER_ID".to_string(), "1".to_string())]);
+        assert!(res.is_err(), "unreadable existing .env must fail closed");
+        assert!(env.is_dir(), "existing content must not be clobbered");
+    }
+
+    #[test]
+    fn env_path_resolution_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("cwd");
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let cwd_env = cwd.join(".env");
+        let data_env = data.join(".env");
+        // An explicit ENV_FILE wins even when the file does not exist yet.
+        let explicit = dir.path().join("explicit.env");
+        assert_eq!(
+            resolve_env_path(Some(explicit.to_str().unwrap()), &cwd_env, &data_env),
+            explicit
+        );
+        // A blank ENV_FILE value falls through to the normal order.
+        assert_eq!(resolve_env_path(Some("  "), &cwd_env, &data_env), cwd_env);
+        // Neither exists: a fresh file lands in the cwd.
+        assert_eq!(resolve_env_path(None, &cwd_env, &data_env), cwd_env);
+        // Only the data-dir copy exists: it is picked up.
+        std::fs::write(&data_env, "X=1\n").unwrap();
+        assert_eq!(resolve_env_path(None, &cwd_env, &data_env), data_env);
+        // Both exist: cwd wins.
+        std::fs::write(&cwd_env, "Y=1\n").unwrap();
+        assert_eq!(resolve_env_path(None, &cwd_env, &data_env), cwd_env);
     }
 }
