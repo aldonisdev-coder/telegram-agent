@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    image: telegram-agent:latest
+    container_name: telegram-agent
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    env_file:
+      - path: ./.env
+        required: false
+    environment:
+      - DATABASE_URL=sqlite:/app/data/agent.db
+      - WEB_PORT=8080
+      - WEB_BIND=0.0.0.0
+      - OPEN_BROWSER=0
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

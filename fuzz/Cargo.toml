@@ -1,0 +1,20 @@
+[package]
+name = "telegram-agent-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+telegram-agent = { path = ".." }
+
+[[bin]]
+name = "fuzz_core"
+path = "fuzz_targets/fuzz_core.rs"
+test = false
+doc = false
+bench = false

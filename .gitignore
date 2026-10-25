@@ -1,0 +1,30 @@
+# Build artifacts
+/target
+/dist
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+
+# Live data — never commit business state or secrets
+/data
+/backups
+*.db
+.env
+.env.*
+!.env.example
+
+# Local agent tooling — internal workflow, not published
+/.opencode
+/.commandcode
+/.mimosa
+
+# Vendored dependency sources — public builds resolve from crates.io;
+# the local copy stays on disk for offline builds only
+/vendor
+
+# Release bundles — binaries ship as GitHub Releases, not in the tree
+/telegram-agent-*/
+
+# OS noise
+.DS_Store
+Thumbs.db

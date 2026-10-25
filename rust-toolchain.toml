@@ -1,0 +1,5 @@
+# Pin the toolchain so every build (local, CI, contributors) uses one rustc.
+# Fedora's /usr/bin/cargo ignores this file, but rustup-managed cargo respects
+# it; use `rustup run stable cargo …` if your PATH resolves to a system cargo.
+[toolchain]
+channel = "1.99.1"

@@ -1,0 +1,100 @@
+# Release workflow: builds desktop distributions for all three platforms on a
+# version tag (v*). Produces the same artifacts as scripts/package.sh locally.
+#
+#   git tag v0.1.0 && git push --tags
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Package
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          STAGE="telegram-agent-${VERSION}-linux-x64"
+          mkdir -p "$STAGE"
+          cp target/release/telegram-agent "$STAGE/"
+          cp .env.example "$STAGE/"
+          cp assets/icon.png "$STAGE/" 2>/dev/null || true
+          tar -czf "telegram-agent-${VERSION}-linux-x64.tar.gz" "$STAGE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: telegram-agent-*.tar.gz
+
+  build-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: dist/*.tar.gz
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Package
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          STAGE="telegram-agent-${VERSION}-windows-x64"
+          mkdir -p "$STAGE"
+          cp target/release/telegram-agent.exe "$STAGE/"
+          cp .env.example "$STAGE/"
+          cp assets/icon.ico "$STAGE/" 2>/dev/null || true
+          powershell Compress-Archive -Path "$STAGE" -DestinationPath "${STAGE}.zip"
+        # icon + version resources are embedded by build.rs via winresource
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: telegram-agent-*.zip
+
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/package.sh ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.target }}
+          path: dist/*.zip
+
+  release:
+    needs: [build-linux, build-linux-arm64, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tar.gz
+            *.zip
+          generate_release_notes: true

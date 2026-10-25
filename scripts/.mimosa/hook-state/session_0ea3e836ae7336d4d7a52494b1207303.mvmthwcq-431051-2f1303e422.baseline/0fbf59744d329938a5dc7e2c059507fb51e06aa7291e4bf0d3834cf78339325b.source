@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# doctor.sh -- environment diagnostics for Telegram Agent. Read-only; safe to
+# run anywhere (desktop, server, container). Exit 0 = healthy, 1 = problems.
+#
+#   scripts/doctor.sh            # check the current environment
+#   scripts/doctor.sh --fix-hints# same, plus suggested fixes for each failure
+set -uo pipefail
+cd "$(dirname "$0")/.."
+ROOT="$(pwd)"
+FIX_HINTS=0
+[[ "${1:-}" == "--fix-hints" ]] && FIX_HINTS=1
+
+PASS=0; FAIL=0; WARN=0
+ok()   { PASS=$((PASS+1)); echo "  [ok]   $1"; }
+bad()  { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
+warn() { WARN=$((WARN+1)); echo "  [warn] $1"; }
+hint() { [[ "$FIX_HINTS" == "1" ]] && echo "         fix: $1" || true; }
+
+echo "=== telegram-agent doctor ==="
+uname -sr | sed 's/^/os:       /'
+
+# --- binary -------------------------------------------------------------
+BIN=""
+for c in "$ROOT/target/release/telegram-agent" "/opt/telegram-agent/telegram-agent" \
+         "$ROOT/target/debug/telegram-agent" "$(command -v telegram-agent || true)"; do
+  [[ -n "$c" && -x "$c" ]] && { BIN="$c"; break; }
+done
+if [[ -n "$BIN" ]]; then
+  ok "binary: $BIN ($(du -h "$BIN" | cut -f1))"
+else
+  bad "no binary found (build: cargo build --release / make build)"
+  hint "run ./setup.sh or make setup"
+fi
+
+# --- configuration ------------------------------------------------------
+ENV_PATH=""
+for f in "$ROOT/.env" "/opt/telegram-agent/.env"; do
+  [[ -f "$f" ]] && { ENV_PATH="$f"; break; }
+done
+if [[ -n "$ENV_PATH" ]]; then
+  ok "env file: $ENV_PATH"
+  PERM="$(stat -c '%a' "$ENV_PATH" 2>/dev/null || echo '?')"
+  [[ "$PERM" == "600" ]] && ok "env permissions: 600" \
+    || { warn "env permissions: $PERM (should be 600)"; hint "chmod 600 $ENV_PATH"; }
+  # shellcheck disable=SC1090
+  set -a; . "$ENV_PATH" 2>/dev/null; set +a
+  [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] && ok "bot token: present" \
+    || { warn "bot token: missing (setup mode)"; hint "configure via the web UI or $ENV_PATH"; }
+  [[ "${OWNER_ID:-}" =~ ^[0-9]+$ && "${OWNER_ID:-0}" != "0" ]] && ok "owner id: set" \
+    || { warn "owner id: not set"; }
+  BIND="${WEB_BIND:-127.0.0.1}"
+  if [[ "$BIND" == "0.0.0.0" ]]; then
+    warn "WEB_BIND=0.0.0.0 (dashboard exposed to the network)"
+    hint "keep 127.0.0.1 and use a TLS reverse proxy (see docs/DEPLOY_PROFILES.md)"
+  else
+    ok "web bind: $BIND"
+  fi
+else
+  warn "no .env found (first run will start in setup mode)"
+fi
+PORT="${WEB_PORT:-8080}"
+
+# --- data ---------------------------------------------------------------
+DATA="${DATABASE_DIR:-}"
+[[ -z "$DATA" && -n "${DATABASE_URL:-}" ]] && DATA="${DATABASE_URL#sqlite:}"
+[[ -z "$DATA" ]] && DATA="$ROOT/data"
+if [[ -f "$DATA/agent.db" ]]; then
+  ok "database: $DATA/agent.db ($(du -h "$DATA/agent.db" | cut -f1))"
+  if command -v sqlite3 >/dev/null; then
+    INTEG="$(sqlite3 "$DATA/agent.db" 'PRAGMA integrity_check;' 2>/dev/null || echo 'error')"
+    [[ "$INTEG" == "ok" ]] && ok "database integrity: ok" \
+      || { warn "database integrity: $INTEG"; hint "back up the file, then investigate"; }
+  else
+    warn "sqlite3 not installed -- skipped integrity check"
+  fi
+else
+  warn "no database yet at $DATA/agent.db (created on first run)"
+fi
+if [[ -d "$DATA" ]] && [[ -w "$DATA" ]]; then ok "data dir writable: $DATA"
+else bad "data dir not writable: $DATA"; hint "chown -R \$(id -un) $DATA"; fi
+
+# --- network ------------------------------------------------------------
+if command -v curl >/dev/null; then
+  if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+    if curl -fsS --max-time 8 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" \
+        -o /dev/null 2>/dev/null; then
+      ok "telegram api: token accepted"
+    else
+      bad "telegram api: token rejected or unreachable"
+      hint "verify the token with @BotFather; check outbound network/DNS"
+    fi
+  fi
+  CODE="$(curl -s -o /dev/null --max-time 5 -w '%{http_code}' \
+    "http://${BIND#0.0.0.0/127.0.0.1}:${PORT}/login" 2>/dev/null || echo 000)"
+  case "$CODE" in
+    200|301|302|303) ok "dashboard: responding (HTTP $CODE) on :$PORT" ;;
+    000) [[ -n "$BIN" ]] && { warn "dashboard: not running on :$PORT"; hint "make run / systemctl start telegram-agent"; } ;;
+    *) warn "dashboard: HTTP $CODE on :$PORT" ;;
+  esac
+else
+  warn "curl not installed -- skipped network checks"
+fi
+
+# --- service ------------------------------------------------------------
+if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null; then
+  if systemctl is-active --quiet telegram-agent 2>/dev/null; then
+    ok "systemd service: active"
+    ERRS="$(journalctl -u telegram-agent --since -24h -p err --no-pager 2>/dev/null | wc -l)"
+    [[ "$ERRS" == "0" ]] || warn "$ERRS error-level journal lines in the last 24h"
+  else
+    systemctl is-enabled --quiet telegram-agent 2>/dev/null \
+      && warn "systemd service: enabled but not running" \
+      || true
+  fi
+fi
+if command -v docker >/dev/null && docker compose ls 2>/dev/null | grep -q "$(basename "$ROOT")\$"; then
+  ok "docker compose project detected"
+fi
+
+echo "=== $PASS ok, $WARN warn, $FAIL fail ==="
+[[ "$FAIL" -eq 0 ]]

@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""verify-agent-tiers.py -- machine-check the role-level routing contract.
+
+Enforces the ladder declared in AUTO_ROUTE.md and .opencode/agents/*.md:
+
+  1. Ladder is contiguous L3..L11, exactly one agent per rung (charter agents
+     like L6-C may sit alongside their base rung).
+  2. Every agent carries the safety denies (rm -rf, sudo, git push,
+     git reset --hard) and the secrets floor (*.env read deny).
+  3. L3 (verification) is structurally read-only: no edit/write allows.
+  4. No agent holds allow over the machinery that binds it (.opencode/**,
+     scripts/**): any agent with a broad write allow must deny those trees.
+  5. Every claimed territory resolves to a path on disk.
+  6. AUTO_ROUTE.md ladder rows agree with agent charters, and every agent is
+     listed there.
+
+Exit code 0 = contract holds. Any violation prints FAIL lines and exits 1.
+Run: python3 scripts/verify-agent-tiers.py   (from repo root or anywhere)
+"""
+
+from __future__ import annotations
+
+import glob
+import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+AGENTS_DIR = os.path.join(ROOT, ".opencode", "agents")
+AUTO_ROUTE = os.path.join(ROOT, "AUTO_ROUTE.md")
+
+SAFETY_DENIES = ["rm -rf*", "sudo *", "git push*", "git reset --hard*"]
+# No agent may write the machinery that binds the ladder: the agents dir or
+# the checker itself (whole scripts/ tree counts -- it contains the checker).
+MACHINERY_TREES = [".opencode/**", "scripts/**", "scripts/verify-agent-tiers.py"]
+LADDER = [f"L{n}" for n in range(3, 12)]  # L3..L11
+CHARTER_RUNGS = {"L6-C": "L6"}  # charter agents sit alongside a base rung
+
+
+def parse_agent(path: str) -> dict:
+    """Parse the YAML-subset frontmatter used by agent files (stdlib only)."""
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    m = re.match(r"^---\n(.*?)\n---\n", text, re.DOTALL)
+    if not m:
+        return {"_file": path, "_error": "no frontmatter"}
+
+    agent: dict = {"_file": path, "permission": {}, "territory": []}
+    section = None  # current permission subsection: bash/read/edit/write
+    in_list = False
+
+    for raw in m.group(1).splitlines():
+        if not raw.strip():
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        line = raw.strip()
+
+        if in_list and line.startswith("- "):
+            agent["territory"].append(line[2:].strip().strip('"'))
+            continue
+        in_list = False
+
+        if indent == 0:
+            section = None
+            key, _, value = line.partition(":")
+            key, value = key.strip(), value.strip()
+            if key in ("permission", "territory") and not value:
+                if key == "territory":
+                    in_list = True
+                continue
+            if value == ">":  # multi-line description follows; skip until dedent
+                continue
+            agent[key] = value.strip('"')
+        elif indent == 2 and line.endswith(":"):
+            section = line[:-1]
+            agent["permission"][section] = {}
+        elif indent >= 4 and section:
+            pm = re.match(r'^"(.*)":\s*(allow|deny)$', line) or re.match(
+                r"^(\S+):\s*(allow|deny)$", line
+            )
+            if pm:
+                agent["permission"][section][pm.group(1)] = pm.group(2)
+    return agent
+
+
+def check(agents: list[dict]) -> list[str]:
+    failures: list[str] = []
+
+    def fail(msg: str) -> None:
+        failures.append(msg)
+
+    by_name = {a.get("name"): a for a in agents}
+    rungs: dict[str, list[str]] = {}
+
+    # -- 1. ladder contiguity ------------------------------------------------
+    for a in agents:
+        charter = a.get("charter_of", "")
+        base = CHARTER_RUNGS.get(charter, charter)
+        if base not in LADDER and base not in CHARTER_RUNGS:
+            fail(f"{a['_file']}: charter_of '{charter}' is outside L3..L11")
+            continue
+        rungs.setdefault(base, []).append(a.get("name", "?"))
+    for rung in LADDER:
+        owners = rungs.get(rung, [])
+        if len(owners) == 0:
+            fail(f"ladder gap: no agent owns rung {rung}")
+        elif len(owners) > 1:
+            # allowed only when one is a charter agent (distinct charter_of)
+            charters = {a.get("charter_of") for a in agents if a.get("name") in owners}
+            if len(charters) == 1:
+                fail(f"rung {rung} owned by multiple agents: {owners}")
+
+    # -- 2. safety denies + secrets floor ------------------------------------
+    for a in agents:
+        bash = a.get("permission", {}).get("bash", {})
+        for pattern in SAFETY_DENIES:
+            if bash.get(pattern) != "deny":
+                fail(f"{a.get('name')}: bash lacks deny for '{pattern}'")
+        reads = a.get("permission", {}).get("read", {})
+        if reads.get("*.env") != "deny":
+            fail(f"{a.get('name')}: read lacks '*.env' deny (secrets floor)")
+
+    # -- 3. L3 verification is read-only --------------------------------------
+    for a in agents:
+        if a.get("charter_of") == "L3":
+            for scope in ("edit", "write"):
+                allows = {
+                    p: e
+                    for p, e in a.get("permission", {}).get(scope, {}).items()
+                    if e == "allow"
+                }
+                if allows:
+                    fail(
+                        f"L3 {a.get('name')} must be read-only, but {scope} allows: "
+                        f"{sorted(allows)}"
+                    )
+
+    # -- 4. no agent binds itself: machinery trees are denied for broad writers
+    #        and never granted explicitly to anyone
+    for a in agents:
+        for scope in ("edit", "write"):
+            perms = a.get("permission", {}).get(scope, {})
+            broad = any(p in ("*", "**") for p, e in perms.items() if e == "allow")
+            if broad:
+                for tree in MACHINERY_TREES:
+                    if perms.get(tree) != "deny":
+                        fail(
+                            f"{a.get('name')}: broad {scope} allow without deny on "
+                            f"'{tree}' (machinery that binds the ladder)"
+                        )
+            for pattern, effect in perms.items():
+                if effect == "allow" and pattern in MACHINERY_TREES:
+                    fail(
+                        f"{a.get('name')}: {scope} grants '{pattern}' -- "
+                        f"no agent may hold allow over the machinery that binds it"
+                    )
+
+    # -- 5. territories resolve on disk ---------------------------------------
+    for a in agents:
+        for pattern in a.get("territory", []):
+            probe = re.sub(r"/\*\*$|/\*$", "", pattern)  # dir glob suffix
+            if "*" in probe:
+                hits = glob.glob(os.path.join(ROOT, probe)) or glob.glob(
+                    os.path.join(ROOT, "**", probe), recursive=True
+                )
+                if not hits:
+                    fail(f"{a.get('name')}: territory '{pattern}' matches nothing on disk")
+            elif not os.path.exists(os.path.join(ROOT, probe)):
+                fail(f"{a.get('name')}: territory '{pattern}' does not exist")
+
+    # -- 6. AUTO_ROUTE.md agrees with the agents directory --------------------
+    if not os.path.exists(AUTO_ROUTE):
+        fail("AUTO_ROUTE.md missing")
+    else:
+        with open(AUTO_ROUTE, encoding="utf-8") as fh:
+            rows = re.findall(r"^\|\s*(L\d+(?:-C)?)\s*\|\s*([a-z0-9-]+)\s*\|", fh.read(), re.M)
+        seen: dict[str, str] = {}
+        for level, name in rows:
+            if name not in by_name:
+                fail(f"AUTO_ROUTE.md lists agent '{name}' with no file in .opencode/agents/")
+                continue
+            charter = by_name[name].get("charter_of", "")
+            if charter != level:
+                fail(
+                    f"AUTO_ROUTE.md says {name} is {level}, "
+                    f"agent file says {charter}"
+                )
+            seen[name] = level
+        for a in agents:
+            if a.get("name") not in seen:
+                fail(f"{a.get('name')}: defined in .opencode/agents/ but missing from AUTO_ROUTE.md ladder")
+
+    return failures
+
+
+def main() -> int:
+    if not os.path.isdir(AGENTS_DIR):
+        print(f"FAIL: no agents directory at {AGENTS_DIR}")
+        return 1
+    agents = [
+        parse_agent(os.path.join(AGENTS_DIR, f))
+        for f in sorted(os.listdir(AGENTS_DIR))
+        if f.endswith(".md") and f != "README.md"
+    ]
+    bad = [a for a in agents if a.get("_error")]
+    for a in bad:
+        print(f"FAIL: {a['_file']}: {a['_error']}")
+    if bad:
+        return 1
+
+    ladder = " ".join(
+        f"{a.get('charter_of')}={a.get('name')}" for a in sorted(agents, key=lambda x: x.get("charter_of", ""))
+    )
+    print(f"agents: {len(agents)}")
+    print(f"ladder: {ladder}")
+
+    failures = check(agents)
+    if failures:
+        print()
+        for f in failures:
+            print(f"FAIL: {f}")
+        print(f"\n{len(failures)} violation(s). Routing contract does not hold.")
+        return 1
+    print("\nOK: ladder contiguous L3-L11, safety denies present, L3 read-only, "
+          "machinery unbindable, territories resolve, AUTO_ROUTE.md consistent.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

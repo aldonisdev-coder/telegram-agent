@@ -1,0 +1,47 @@
+[package]
+name = "telegram-agent"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+# Smaller, self-contained release binaries for desktop distribution (.exe/.app/tar.gz).
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# Icon/version embedding for telegram-agent.exe. Scoped to Windows hosts so
+# other platforms never compile it (keeps mixed-toolchain clippy builds clean);
+# release CI builds the Windows artifact on a Windows runner.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+proptest = "1.11"
+
+[patch.crates-io]
+teloxide = { path = "vendor/teloxide" }
+
+[dependencies]
+teloxide = { version = "0.17", features = ["macros", "ctrlc_handler", "sqlite-storage-rustls"] }
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+dotenvy = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+cookie = "0.18"
+sha2 = "0.10"
+async-trait = "0.1"
+bcrypt = "0.15"
+getrandom = "0.4"
