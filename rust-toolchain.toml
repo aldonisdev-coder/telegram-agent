@@ -3,3 +3,4 @@
 # it; use `rustup run stable cargo …` if your PATH resolves to a system cargo.
 [toolchain]
 channel = "1.99.1"
+components = ["clippy", "rustfmt"]
